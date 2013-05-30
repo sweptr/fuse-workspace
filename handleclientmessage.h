@@ -16,9 +16,11 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
+#ifndef NOTIFYFS_HANDLECLIENTMESSAGE_H
+#define NOTIFYFS_HANDLECLIENTMESSAGE_H
 
-#ifndef SIMPLEOVERLAYFS_MAIN_H
-#define SIMPLEOVERLAYFS_MAIN_H
+// Prototypes
 
+void init_handleclientmessage(struct workerthreads_queue_struct *workerthreads_queue);
 
 #endif

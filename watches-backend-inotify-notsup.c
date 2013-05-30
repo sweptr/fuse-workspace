@@ -17,8 +17,26 @@
 
 */
 
-#ifndef SIMPLEOVERLAYFS_MAIN_H
-#define SIMPLEOVERLAYFS_MAIN_H
+static inline int set_watch_backend_inotify(struct watch_struct *watch, char *path)
+{
+    return 0;
+}
+static inline int change_watch_backend_inotify(struct watch_struct *watch, char *path)
+{
+    return 0;
+}
+static inline void remove_watch_backend_inotify(struct watch_struct *watch)
+{
+    return;
+}
 
+static inline void initialize_inotify()
+{
+    return;
+}
 
-#endif
+static inline void close_inotify()
+{
+    return;
+
+}

@@ -20,11 +20,21 @@
 #ifndef OVERLAYFS_ENTRY_MANAGEMENT_H
 #define OVERLAYFS_ENTRY_MANAGEMENT_H
 
+#include <fuse/fuse_lowlevel.h>
+
+#define FSEVENT_INODE_STATUS_OK			1
+#define FSEVENT_INODE_STATUS_TOBEREMOVED	2
+#define FSEVENT_INODE_STATUS_REMOVED		3
+#define FSEVENT_INODE_STATUS_TOBEUNMOUNTED	4
+#define FSEVENT_INODE_STATUS_UNMOUNTED		5
+#define FSEVENT_INODE_STATUS_SLEEP		6
+
 struct inode_struct {
     fuse_ino_t ino;
     uint64_t nlookup;
     struct inode_struct *id_next;
     struct entry_struct *alias;
+    unsigned char status;
     struct stat st;
 };
 
@@ -57,6 +67,7 @@ void init_entry(struct entry_struct *entry);
 void assign_inode(struct entry_struct *entry);
 int create_root();
 unsigned char isrootentry(struct entry_struct *entry);
+struct entry_struct *get_rootentry();
 unsigned long long get_inoctr();
 
 struct entry_struct *get_next_entry(struct entry_struct *parent, struct entry_struct *entry);

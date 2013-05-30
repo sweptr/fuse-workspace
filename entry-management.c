@@ -774,6 +774,7 @@ static struct inode_struct *create_inode()
 	inode->ino=inoctr;
 	inode->id_next=NULL;
 	inode->alias=NULL;
+	inode->status=FSEVENT_INODE_STATUS_OK;
 
 	clear_stat(&inode->st);
 
@@ -852,4 +853,8 @@ unsigned char isrootentry(struct entry_struct *entry)
     return (entry==rootentry) ? 1 : 0;
 }
 
+struct entry_struct *get_rootentry()
+{
+    return rootentry;
+}
 

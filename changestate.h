@@ -1,5 +1,6 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+
+  2010, 2011, 2012 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -16,9 +17,16 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
+#ifndef NOTIFYFS_CHANGESTATE_H
+#define NOTIFYFS_CHANGESTATE_H
 
-#ifndef SIMPLEOVERLAYFS_MAIN_H
-#define SIMPLEOVERLAYFS_MAIN_H
+// Prototypes
 
+void queue_fsevent(struct notifyfs_fsevent_struct *notifyfs_fsevent);
+struct notifyfs_fsevent_struct *create_fsevent(struct entry_struct *entry);
+void init_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
+void destroy_notifyfs_fsevent(struct notifyfs_fsevent_struct *fsevent);
+
+void init_changestate(struct workerthreads_queue_struct *workerthreads_queue);
 
 #endif

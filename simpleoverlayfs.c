@@ -59,14 +59,33 @@
 #include "entry-management.h"
 #include "path-resolution.h"
 #include "logging.h"
+
+#include "notifyfs-fsevent.h"
+
 #include "simpleoverlayfs.h"
 #include "epoll-utils.h"
 #include "handlefuseevent.h"
 #include "utils.h"
 #include "options.h"
+#include "socket.h"
+
+#include "watches.h"
+
+#include "changestate.h"
+
+#include "handleclientmessage.h"
+
+#include "message-base.h"
+#include "message-receive.h"
+#include "message-send.h"
+
+
+
+
 
 struct overlayfs_options_struct overlayfs_options;
-
+struct notifyfs_connection_struct notifyfsserver;
+char *recv_buffer=NULL;
 
 unsigned char loglevel=0;
 int logarea=0;
@@ -117,8 +136,9 @@ static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *n
     struct entry_struct *parent;
     struct inode_struct *inode;
     int nreturn=0;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
     unsigned char inodecreated=0;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("LOOKUP, name: %s", name);
 
@@ -140,18 +160,24 @@ static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *n
 
     }
 
-    path_info.parent=parent;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
+    call_info.entry=parent;
 
-    nreturn=get_path(&path_info, name);
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    nreturn=get_path(&call_info, name);
     if (nreturn<0) goto out;
 
     /* check entry on underlying fs 
 	just the root for now (no prefix)*/
 
-    nreturn=lstat(path_info.path, &(e.attr));
+    nreturn=lstat(call_info.pathinfo.path, &(e.attr));
 
     if (nreturn==-1) {
 	struct entry_struct *entry;
@@ -277,7 +303,7 @@ static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *n
 
     }
 
-    clear_path_info(&path_info);
+    free_path_pathinfo(&call_info.pathinfo);
 
 }
 
@@ -316,7 +342,8 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     struct entry_struct *entry;
     struct inode_struct *inode;
     int nreturn=0;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("GETATTR");
 
@@ -338,20 +365,23 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     }
 
-    path_info.parent=NULL;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
+    call_info.entry=entry;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
 
     if (isrootentry(entry)==1) {
 
-	path_info.path=(char *) rootpath;
+	call_info.pathinfo.path=(char *) rootpath;
 
     } else {
 
-	path_info.parent=entry->parent;
-
-	nreturn=get_path(&path_info, entry->name);
+	nreturn=get_path(&call_info, NULL);
 	if (nreturn<0) goto out;
 
     }
@@ -359,7 +389,7 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     /* check entry on underlying fs 
 	just the root for now (no prefix)*/
 
-    nreturn=lstat(path_info.path, &st);
+    nreturn=lstat(call_info.pathinfo.path, &st);
 
     if (nreturn==-1) nreturn=-errno;
 
@@ -393,7 +423,7 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     }
 
-    clear_path_info(&path_info);
+    free_path_pathinfo(&call_info.pathinfo);
 
 }
 
@@ -403,10 +433,11 @@ static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *na
     struct entry_struct *entry;
     int nreturn=0;
     unsigned char entrycreated=0;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
     uid_t uid_keep;
     gid_t gid_keep;
     mode_t umask_keep;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("MKDIR, name: %s", name);
 
@@ -456,21 +487,26 @@ static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     }
 
-    path_info.parent=entry->parent;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
+    call_info.entry=entry;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
 
-    nreturn=get_path(&path_info, name);
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    nreturn=get_path(&call_info, NULL);
     if ( nreturn<0) goto out;
 
     /* change to uid/gid/umask of user */
 
-    uid_keep=setfsuid(path_info.ctx->uid);
-    gid_keep=setfsgid(path_info.ctx->gid);
-    umask_keep=umask(path_info.ctx->umask);
+    uid_keep=setfsuid(call_info.uid);
+    gid_keep=setfsgid(call_info.gid);
+    umask_keep=umask(call_info.umask);
 
-    nreturn=mkdir(path_info.path, mode);
+    nreturn=mkdir(call_info.pathinfo.path, mode);
 
     /* change back */
 
@@ -505,11 +541,9 @@ static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *na
         add_to_name_hash_table(entry);
 	add_to_inode_hash_table(entry->inode);
 
-        logoutput("mkdir: successfull");
-
         fuse_reply_entry(req, &e);
 
-	clear_path_info(&path_info);
+	free_path_pathinfo(&call_info.pathinfo);
 
         return;
 
@@ -526,7 +560,7 @@ static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     fuse_reply_err(req, abs(nreturn));
 
-    clear_path_info(&path_info);
+    free_path_pathinfo(&call_info.pathinfo);
 
 }
 
@@ -537,10 +571,11 @@ static void overlayfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *na
     struct entry_struct *entry;
     int nreturn=0;
     unsigned char entrycreated=0;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
     uid_t uid_keep;
     gid_t gid_keep;
     mode_t umask_keep;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("MKNOD, name: %s", name);
 
@@ -590,21 +625,27 @@ static void overlayfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     }
 
-    path_info.parent=entry->parent;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
 
-    nreturn=get_path(&path_info, name);
+    call_info.entry=entry;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    nreturn=get_path(&call_info, NULL);
     if ( nreturn<0) goto out;
 
     /* change to uid/gid/umask of user */
 
-    uid_keep=setfsuid(path_info.ctx->uid);
-    gid_keep=setfsgid(path_info.ctx->gid);
-    umask_keep=umask(path_info.ctx->umask);
+    uid_keep=setfsuid(call_info.uid);
+    gid_keep=setfsgid(call_info.gid);
+    umask_keep=umask(call_info.umask);
 
-    nreturn=mknod(path_info.path, mode, rdev);
+    nreturn=mknod(call_info.pathinfo.path, mode, rdev);
 
     /* change back */
 
@@ -644,7 +685,7 @@ static void overlayfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *na
 
         fuse_reply_entry(req, &e);
 
-	clear_path_info(&path_info);
+	free_path_pathinfo(&call_info.pathinfo);
 
         return;
 
@@ -654,19 +695,14 @@ static void overlayfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *na
 
     logoutput("mkdir: error %i", nreturn);
 
-    if ( entrycreated==1 ) {
-
-	remove_entry(entry);
-
-    }
+    if ( entrycreated==1 ) remove_entry(entry);
 
     e.ino = 0;
     e.entry_timeout = overlayfs_options.negative_timeout;
 
     fuse_reply_err(req, abs(nreturn));
 
-    clear_path_info(&path_info);
-
+    free_path_pathinfo(&call_info.pathinfo);
 }
 
 static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
@@ -674,9 +710,10 @@ static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
     struct entry_struct *entry;
     struct inode_struct *inode;
     int nreturn=0;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
     size_t size=512;
     char *buff=NULL;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("READLINK");
 
@@ -698,20 +735,23 @@ static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
 
     }
 
-    path_info.parent=NULL;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
+    call_info.entry=entry;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
 
     if (isrootentry(entry)==1) {
 
-	path_info.path=(char *)rootpath;
+	call_info.pathinfo.path=(char *)rootpath;
 
     } else {
 
-	path_info.parent=entry->parent;
-
-	nreturn=get_path(&path_info, entry->name);
+	nreturn=get_path(&call_info, NULL);
 	if (nreturn<0) goto out;
 
     }
@@ -739,10 +779,10 @@ static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
 
 	}
 
-	uid_keep=setfsuid(path_info.ctx->uid);
-	gid_keep=setfsgid(path_info.ctx->gid);
+	uid_keep=setfsuid(call_info.uid);
+	gid_keep=setfsgid(call_info.gid);
 
-    	res = readlink(path_info.path, buff, size);
+    	res = readlink(call_info.pathinfo.path, buff, size);
 	if ( res==-1) nreturn=-errno;
 
 	setfsuid(uid_keep);
@@ -777,7 +817,7 @@ static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
 
     }
 
-    clear_path_info(&path_info);
+    free_path_pathinfo(&call_info.pathinfo);
 
     if (buff) {
 
@@ -861,9 +901,10 @@ static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     int nreturn=0;
     struct entry_struct *entry;
     struct inode_struct *inode;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
     DIR *dp=NULL;
     struct stat st;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("OPENDIR");
 
@@ -885,25 +926,28 @@ static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     }
 
-    path_info.parent=NULL;
-    path_info.ctx=fuse_req_ctx(req);
-    path_info.path=NULL;
-    path_info.freepath=0;
+    call_info.entry=entry;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
 
     if (isrootentry(entry)==1) {
 
-	path_info.path=(char *)rootpath;
+	call_info.pathinfo.path=(char *)rootpath;
 
     } else {
 
-	path_info.parent=entry->parent;
-
-	nreturn=get_path(&path_info, entry->name);
+	nreturn=get_path(&call_info, NULL);
 	if (nreturn<0) goto out;
 
     }
 
-    if (stat(path_info.path, &st)==-1) {
+    if (stat(call_info.pathinfo.path, &st)==-1) {
 
 	/* handle error here */
 
@@ -951,7 +995,7 @@ static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
 	/* open directory */
 
-	generic_dirp->data=(void *)opendir(path_info.path);
+	generic_dirp->data=(void *)opendir(call_info.pathinfo.path);
 
 	if ( ! generic_dirp->data) {
 
@@ -996,7 +1040,7 @@ static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     logoutput("opendir, nreturn %i", nreturn);
 
-    clear_path_info(&path_info);
+    free_path_pathinfo(&call_info.pathinfo);
 
 }
 
@@ -1330,7 +1374,7 @@ static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
     int nreturn=0, res;
     struct entry_struct *entry; 
     struct inode_struct *inode;
-    struct path_info_struct path_info=PATH_INFO_INIT;
+    struct call_info_struct call_info=CALL_INFO_INIT;
 
     logoutput("STATFS");
 
@@ -1433,6 +1477,59 @@ struct fuse_lowlevel_ops overlayfs_oper = {
     .statfs	= overlayfs_statfs,
 };
 
+int process_server_event(struct notifyfs_connection_struct *connection, uint32_t events)
+{
+
+    if (events & EPOLLIN) {
+
+	int res=receive_message(connection->fd, connection->data, events, NOTIFYFS_OWNERTYPE_SERVER, recv_buffer, NOTIFYFS_RECVBUFFERSIZE);
+
+    }
+
+    if (events & (EPOLLHUP|EPOLLRDHUP) ) {
+
+	logoutput("process_server_event: hangup of remote site");
+
+    }
+
+    return 0;
+
+}
+
+/* send a client message, from client to server, like:
+   - register a client as app or as fs or both
+   - signoff as client at server
+   - give messagemask, to inform the server about what messages to receive, like mountinfo
+   */
+
+void send_register_to_server(int fd, char *path)
+{
+    uint64_t unique=new_uniquectr();
+
+    if (send_register_message(fd, unique, getpid(), NOTIFYFS_CLIENTTYPE_FUSEFS,(void *) path, strlen(path)+1)>0) {
+	int res;
+
+	init_notifyfs_reply(unique);
+	res=wait_for_notifyfs_reply(unique, 5);
+
+	if (res==-ETIMEDOUT) {
+
+	    logoutput("send_register_to_server: waiting for reply timed out");
+
+	} else if (res<0) {
+
+	    logoutput("send_register_to_server: error %i waiting a reply", res);
+
+	} else {
+
+	    logoutput("send_register_to_server: received a reply");
+
+	}
+
+    }
+
+}
+
 int main(int argc, char *argv[])
 {
     int res, epoll_fd=0;
@@ -1459,9 +1556,11 @@ int main(int argc, char *argv[])
     set_max_nr_workerthreads(&workerthreads_queue, 6);
     add_workerthreads(&workerthreads_queue, 6);
 
-    //
-    // init the hash lookup tables
-    //
+    init_changestate(&workerthreads_queue);
+
+    /*
+        init the hash lookup tables
+    */
 
     res=init_hashtables();
 
@@ -1473,7 +1572,7 @@ int main(int argc, char *argv[])
     }
 
     /*
-     create the root inode and entry
+        create the root inode and entry
     */
 
     res=create_root();
@@ -1486,7 +1585,7 @@ int main(int argc, char *argv[])
     }
 
     /*
-     set default options
+        set default options
     */
 
     loglevel=overlayfs_options.logging;
@@ -1520,6 +1619,52 @@ int main(int argc, char *argv[])
 
     }
 
+    /*
+	fs notify backends
+    */
+
+    initialize_fsnotify_backends();
+
+
+    /*
+        connect to the notifyfs server
+    */
+
+    notifyfsserver.fd=0;
+    init_xdata(&notifyfsserver.xdata_socket);
+    notifyfsserver.data=NULL;
+    notifyfsserver.type=0;
+    notifyfsserver.allocated=0;
+    notifyfsserver.process_event=NULL;
+
+    if (strlen(overlayfs_options.notifyfs_socket)>0) {
+
+	init_handleclientmessage(&workerthreads_queue);
+
+	int socket_fd=create_local_clientsocket(overlayfs_options.notifyfs_socket, &notifyfsserver, NULL, process_server_event);
+
+	if ( socket_fd<=0 ) {
+
+    	    logoutput("Error creating socket fd: %i when connecting to %s", socket_fd, overlayfs_options.notifyfs_socket);
+	    res=socket_fd;
+    	    goto out;
+
+	}
+
+	recv_buffer=malloc(NOTIFYFS_RECVBUFFERSIZE);
+
+	if (! recv_buffer) {
+
+	    logoutput("Error creating the buffer to receive messages from notifyfs server.");
+	    res=-ENOMEM;
+	    goto out;
+
+	}
+
+	send_register_to_server(socket_fd, overlayfs_options.mountpoint);
+
+    }
+
     /* add the fuse channel(=fd) to the mainloop */
 
     res=initialize_fuse(overlayfs_options.mountpoint, "overlayfs", &overlayfs_oper, sizeof(overlayfs_oper), &global_fuse_args, &workerthreads_queue);
@@ -1535,6 +1680,8 @@ int main(int argc, char *argv[])
 
     destroy_eventloop(NULL);
     fuse_opt_free_args(&global_fuse_args);
+
+    destroy_workerthreads_queue(&workerthreads_queue);
 
     skipeverything:
 

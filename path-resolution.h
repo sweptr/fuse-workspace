@@ -20,13 +20,28 @@
 #ifndef OVERLAYFS_PATH_RESOLUTION_H
 #define OVERLAYFS_PATH_RESOLUTION_H
 
-#define PATH_INFO_INIT	{NULL, NULL, 0, NULL}
+typedef char pathstring[PATH_MAX+1];
 
-struct path_info_struct {
-    struct entry_struct *parent;
+#define CALL_INFO_INIT	{NULL, {NULL, 0, 0}, 0, 0, 0, 0, 0}
+
+#define PATHINFOFLAGS_NONE		0
+#define PATHINFOFLAGS_ALLOCATED		1
+#define PATHINFOFLAGS_INUSE		2
+
+struct pathinfo_struct {
     char *path;
-    unsigned char freepath;
-    const struct fuse_ctx *ctx;
+    int len;
+    unsigned char flags;
+};
+
+struct call_info_struct {
+    struct entry_struct *entry;
+    struct pathinfo_struct pathinfo;
+    pid_t pid;
+    uid_t uid;
+    gid_t gid;
+    mode_t umask;
+    unsigned int error;
 };
 
 struct generic_dirp_struct {
@@ -40,7 +55,8 @@ struct generic_dirp_struct {
 
 // Prototypes
 
-int get_path(struct path_info_struct *path_info, const char *name);
-void clear_path_info(struct path_info_struct *path_info);
+int get_path(struct call_info_struct *call_info, const char *name);
+void free_path_pathinfo(struct pathinfo_struct *pathinfo);
+struct entry_struct *check_notifyfs_path(char *path);
 
 #endif

@@ -55,18 +55,29 @@ const char *rootpath="/";
 const char *dotdotname="..";
 const char *dotname=".";
 
-int get_path(struct path_info_struct *path_info, const char *name)
+int get_path(struct call_info_struct *call_info, const char *name)
 {
     int nreturn=0;
-    struct entry_struct *parent=path_info->parent;
+    struct entry_struct *parent=NULL;
+
+    if (name) {
+
+	parent=call_info->entry;
+
+    } else {
+
+	name=call_info->entry->name;
+	parent=call_info->entry->parent;
+
+    }
 
     if ( isrootentry(parent) ) {
 	int len=strlen(name);
 
-	path_info->path=malloc(len+2);
+	call_info->pathinfo.path=malloc(len+2);
 
-	if (path_info->path) {
-	    char *pathstart=path_info->path;
+	if (call_info->pathinfo.path) {
+	    char *pathstart=call_info->pathinfo.path;
 
 	    *pathstart='/';
 	    pathstart++;
@@ -76,7 +87,8 @@ int get_path(struct path_info_struct *path_info, const char *name)
 	    pathstart+=len;
 	    *pathstart='\0';
 
-	    path_info->freepath=1;
+	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+	    call_info->pathinfo.len=len+1;
 
 	} else {
 
@@ -121,12 +133,13 @@ int get_path(struct path_info_struct *path_info, const char *name)
 
 	/* create a path just big enough */
 
-	path_info->path=malloc(pathlen+1);
+	call_info->pathinfo.path=malloc(pathlen+1);
 
-	if ( path_info->path ) {
+	if ( call_info->pathinfo.path ) {
 
-    	    memcpy(path_info->path, pathstart, pathlen+1);
-	    path_info->freepath=1;
+    	    memcpy(call_info->pathinfo.path, pathstart, pathlen+1);
+	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+	    call_info->pathinfo.len=pathlen;
 
 	} else {
 
@@ -142,7 +155,7 @@ int get_path(struct path_info_struct *path_info, const char *name)
 
     } else {
 
-	logoutput("get_path: path: %s", path_info->path);
+	logoutput("get_path: path: %s", call_info->pathinfo.path);
 
     }
 
@@ -150,16 +163,87 @@ int get_path(struct path_info_struct *path_info, const char *name)
 
 }
 
-void clear_path_info(struct path_info_struct *path_info)
+void free_path_pathinfo(struct pathinfo_struct *pathinfo)
 {
+    if ((pathinfo->flags & PATHINFOFLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFOFLAGS_INUSE)) {
 
-    if ( path_info->freepath==1 ) {
+	if (pathinfo->path) {
 
-	free(path_info->path);
-	path_info->path=NULL;
+	    free(pathinfo->path);
+	    pathinfo->path=NULL;
 
-	path_info->freepath=0;
+	}
+
+	pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
 
     }
 
 }
+
+struct entry_struct *check_notifyfs_path(char *path)
+{
+    char *pos, *slash;
+    struct entry_struct *parent_entry, *entry=NULL;
+
+    parent_entry=get_rootentry();
+    entry=parent_entry;
+
+    pos=path;
+
+    while(1) {
+
+        /*  walk through path from begin to end and 
+            check every part */
+
+        slash=strchr(pos, '/');
+
+        if ( slash==pos ) {
+
+            /* ignore the starting slash*/
+
+            pos++;
+
+            /* if nothing more (==only a slash) stop here */
+
+            if (strlen(pos)==0) {
+
+        	// entry=parent_entry;
+        	break;
+
+	    }
+
+            continue;
+
+        }
+
+        if ( slash ) {
+
+	    /* replace the slash by a \0: make the name a string: zero terminated */
+
+            *slash='\0';
+
+        }
+
+        entry=find_entry_table(parent_entry, pos, 1);
+
+        if ( slash ) {
+
+            /* make slash a slash again (was turned into a \0) */
+
+            *slash='/';
+            pos=slash;
+
+        }
+
+	if ( ! entry || ! slash ) break;
+
+	parent_entry=entry;
+
+    }
+
+    out:
+
+    return entry;
+
+}
+

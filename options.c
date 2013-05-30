@@ -42,6 +42,7 @@
 
 #include "logging.h"
 #include "simpleoverlayfs.h"
+#include "path-resolution.h"
 
 #include "options.h"
 
