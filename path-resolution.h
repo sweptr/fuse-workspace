@@ -28,6 +28,9 @@ typedef char pathstring[PATH_MAX+1];
 #define PATHINFOFLAGS_ALLOCATED		1
 #define PATHINFOFLAGS_INUSE		2
 
+#define _OVERLAYFS_MODE_FINISH		1
+#define _OVERLAYFS_MODE_VIRTUAL		2
+
 struct pathinfo_struct {
     char *path;
     int len;
@@ -44,19 +47,32 @@ struct call_info_struct {
     unsigned int error;
 };
 
-struct generic_dirp_struct {
+struct overlayfs_dirp_struct {
     struct entry_struct *parent;
-    char *name;
-    struct stat st;
-    off_t upperfs_offset;
-    void *data;
-    unsigned char virtual;
+    struct entry_struct *entry;
+    off_t offset;
+    unsigned int fd;
+    unsigned char mode;
+    struct timespec synctime;
+    char *buffer;
+    size_t size;
+    unsigned int pos;
+    unsigned int read;
+    unsigned int lenpath;
 };
 
 // Prototypes
 
-int get_path(struct call_info_struct *call_info, const char *name);
+int get_path(struct call_info_struct *call_info, unsigned int *error);
+int get_path_extra(struct call_info_struct *call_info, const char *name, unsigned int *error);
+
 void free_path_pathinfo(struct pathinfo_struct *pathinfo);
-struct entry_struct *check_notifyfs_path(char *path);
+
+int init_pathcache_group(unsigned int *error);
+void clean_pathcache();
+void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry);
+
+void adjust_pathmax(unsigned int len);
+unsigned int get_pathmax();
 
 #endif

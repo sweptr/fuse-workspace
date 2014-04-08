@@ -17,7 +17,7 @@
 
 */
 
-#define FUSE_USE_VERSION 29
+#define FUSE_USE_VERSION 30
 #define _REENTRANT
 #define _GNU_SOURCE
 #define _XOPEN_SOURCE 500
@@ -43,8 +43,6 @@
 #ifndef SIZE_INODE_HASHTABLE
 #define SIZE_INODE_HASHTABLE 32768
 #endif
-
-/*#define UNIX_PATH_MAX           108*/
 
 #define LOGGING
 #define LOG_DEFAULT_LEVEL	1

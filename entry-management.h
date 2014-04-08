@@ -20,56 +20,61 @@
 #ifndef OVERLAYFS_ENTRY_MANAGEMENT_H
 #define OVERLAYFS_ENTRY_MANAGEMENT_H
 
-#include <fuse/fuse_lowlevel.h>
-
-#define FSEVENT_INODE_STATUS_OK			1
-#define FSEVENT_INODE_STATUS_TOBEREMOVED	2
-#define FSEVENT_INODE_STATUS_REMOVED		3
-#define FSEVENT_INODE_STATUS_TOBEUNMOUNTED	4
-#define FSEVENT_INODE_STATUS_UNMOUNTED		5
-#define FSEVENT_INODE_STATUS_SLEEP		6
+#include <fuse3/fuse_lowlevel.h>
 
 struct inode_struct {
-    fuse_ino_t ino;
-    uint64_t nlookup;
-    struct inode_struct *id_next;
-    struct entry_struct *alias;
-    unsigned char status;
-    struct stat st;
+    fuse_ino_t 				ino;
+    uint64_t 				nlookup;
+    struct inode_struct 		*id_next;
+    struct entry_struct 		*alias;
+    mode_t				mode;
+    nlink_t				nlink;
+    uid_t				uid;
+    gid_t				gid;
+    dev_t				rdev;
+    union {
+	off_t				size;
+	void 				*directory;
+    } type;
+    struct timespec			mtim;
+    struct timespec			ctim;
 };
 
 struct entry_struct {
-    char *name;
-    struct inode_struct *inode;
-    struct entry_struct *name_next;
-    struct entry_struct *name_prev;
-    struct entry_struct *parent;
-    int nameindex_value;
+    char 				*name;
+    struct inode_struct 		*inode;
+    struct entry_struct 		*name_next;
+    struct entry_struct 		*name_prev;
+    struct entry_struct 		*parent;
+    unsigned int 			nameindex_value;
+    struct timespec			synctime;
 };
 
 // Prototypes
 
 int init_hashtables();
 
-void add_to_inode_hash_table(struct inode_struct *inode);
-void add_to_name_hash_table(struct entry_struct *entry);
-void remove_entry_from_name_hash(struct entry_struct *entry);
+int init_inode_hashtable(unsigned int *error);
 
-struct inode_struct *find_inode_generic(fuse_ino_t inode);
-
-struct entry_struct *find_entry_table(struct entry_struct *parent, const char *name, unsigned char exact);
-struct entry_struct *find_entry_generic(fuse_ino_t parent, const char *name);
-
+void init_entry(struct entry_struct *entry);
 struct entry_struct *create_entry(struct entry_struct *parent, const char *name, struct inode_struct *inode);
 void remove_entry(struct entry_struct *entry);
 
-void init_entry(struct entry_struct *entry);
 void assign_inode(struct entry_struct *entry);
-int create_root();
+void add_inode_hashtable(struct inode_struct *inode);
+
+int create_root(unsigned int *error);
+
 unsigned char isrootentry(struct entry_struct *entry);
 struct entry_struct *get_rootentry();
-unsigned long long get_inoctr();
 
-struct entry_struct *get_next_entry(struct entry_struct *parent, struct entry_struct *entry);
+unsigned long long get_nrinodes();
+void decrease_nrinodes();
+
+struct inode_struct *find_inode(fuse_ino_t ino);
+struct inode_struct *remove_inode(fuse_ino_t ino);
+struct entry_struct *find_entry(struct entry_struct *parent, const char *name);
+
+struct entry_struct *create_entry_cb(struct entry_struct *parent, const char *name);
 
 #endif

@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2103, 2014 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -30,7 +30,6 @@
 #include <errno.h>
 #include <err.h>
 #include <sys/time.h>
-#include <syslog.h>
 #include <time.h>
 #include <pthread.h>
 #include <ctype.h>
@@ -38,9 +37,10 @@
 
 #include <sys/param.h>
 #include <sys/types.h>
-#include <sys/inotify.h>
-#include <sys/epoll.h>
 #include <sys/fsuid.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <math.h>
 
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
@@ -50,103 +50,104 @@
 #define ENOATTR ENODATA        /* No such attribute */
 #endif
 
-#define LOG_LOGAREA LOG_LOGAREA_FILESYSTEM
+#ifdef LOGGING
 
-#include <fuse/fuse_lowlevel.h>
+#include <syslog.h>
+
+static unsigned char loglevel=1;
+
+static inline void open_logoutput()
+{
+    openlog("simpleoverlays", 0, LOG_SYSLOG);
+}
+
+static inline void close_logoutput()
+{
+    closelog();
+
+}
+
+#define logoutput_debug(...) if (loglevel >= 5) syslog(LOG_DEBUG, __VA_ARGS__)
+#define logoutput_info(...) if (loglevel >= 4) syslog(LOG_INFO, __VA_ARGS__)
+#define logoutput_notice(...) if (loglevel >= 3) syslog(LOG_NOTICE, __VA_ARGS__)
+#define logoutput_warning(...) if (loglevel >= 2) syslog(LOG_WARNING, __VA_ARGS__)
+#define logoutput_error(...) if (loglevel >= 1) syslog(LOG_ERR, __VA_ARGS__)
+
+#define logoutput(...) if (loglevel >= 1) syslog(LOG_DEBUG, __VA_ARGS__)
+
+#else
+
+static inline void open_logoutput()
+{
+    return;
+
+}
+
+static inline void close_logoutput()
+{
+    return;
+
+}
+
+static inline void dummy_nolog()
+{
+    return;
+
+}
+
+#define logoutput_debug(...) dummy_nolog()
+#define logoutput_info(...) dummy_nolog()
+#define logoutput_notice(...) dummy_nolog()
+#define logoutput_warning(...) dummy_nolog()
+#define logoutput_error(...) dummy_nolog()
+
+#endif
+
 
 #include "workerthreads.h"
 
 #include "entry-management.h"
+
+#include "skiplist.h"
+#include "skiplist-utils.h"
+#include "skiplist-delete.h"
+#include "skiplist-find.h"
+#include "skiplist-insert.h"
+
 #include "path-resolution.h"
-#include "logging.h"
-
-#include "notifyfs-fsevent.h"
-
 #include "simpleoverlayfs.h"
-#include "epoll-utils.h"
+#include "beventloop-utils.h"
 #include "handlefuseevent.h"
 #include "utils.h"
 #include "options.h"
-#include "socket.h"
-
-#include "watches.h"
-
-#include "changestate.h"
-
-#include "handleclientmessage.h"
-
-#include "message-base.h"
-#include "message-receive.h"
-#include "message-send.h"
-
-
-
+#include "fschangenotify.h"
 
 
 struct overlayfs_options_struct overlayfs_options;
-struct notifyfs_connection_struct notifyfsserver;
-char *recv_buffer=NULL;
-
-unsigned char loglevel=0;
-int logarea=0;
 
 extern const char *rootpath;
 extern const char *dotdotname;
 extern const char *dotname;
 extern struct fuse_chan *chan;
 
-void notify_kernel_delete(struct entry_struct *entry)
-{
-    int res=0;
-
-    if (!chan) return;
-
-    if (entry->parent) {
-
-#if FUSE_VERSION >= 29
-
-	if (entry->inode) {
-
-	    res=fuse_lowlevel_notify_delete(chan, entry->parent->inode->ino, entry->inode->ino, entry->name, strlen(entry->name));
-
-	}
-
-#else
-
-	res=-ENOSYS;
-
-#endif
-
-	if (res==-ENOSYS) {
-
-	    fuse_lowlevel_notify_inval_entry(chan, entry->parent->inode->ino, entry->name, strlen(entry->name));
-
-	    if (entry->inode) fuse_lowlevel_notify_inval_inode(chan, entry->inode->ino, 0, 0);
-
-	}
-
-    }
-
-}
-
-
-static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *name)
+static void overlayfs_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 {
     struct fuse_entry_param e;
-    struct entry_struct *parent;
+    struct entry_struct *parent=NULL, *entry=NULL;
     struct inode_struct *inode;
-    int nreturn=0;
     struct call_info_struct call_info=CALL_INFO_INIT;
     unsigned char inodecreated=0;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    unsigned int error=0;
+    struct stat st;
 
-    logoutput("LOOKUP, name: %s", name);
+    logoutput("LOOKUP, name: %s, uid %i, gid %i, pid %i", name, (int) ctx->uid, (int) ctx->gid, (int) ctx->pid);
 
-    inode=find_inode_generic(parentino);
+    inode=find_inode(ino);
 
     if ( ! inode ) {
 
-	nreturn=-ENOENT;
+	error=ENOENT;
 	goto out;
 
     }
@@ -155,7 +156,7 @@ static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *n
 
     if ( ! parent ) {
 
-	nreturn=-ENOENT;
+	error=ENOENT;
 	goto out;
 
     }
@@ -171,135 +172,114 @@ static void overlayfs_lookup(fuse_req_t req, fuse_ino_t parentino, const char *n
     call_info.pathinfo.len=0;
     call_info.pathinfo.flags=0;
 
-    nreturn=get_path(&call_info, name);
-    if (nreturn<0) goto out;
+    if (get_path_extra(&call_info, name, &error)==-1) goto out;
 
     /* check entry on underlying fs 
 	just the root for now (no prefix)*/
 
-    nreturn=lstat(call_info.pathinfo.path, &(e.attr));
+    memset(&st, 0, sizeof(struct stat));
 
-    if (nreturn==-1) {
-	struct entry_struct *entry;
+    if (lstat(call_info.pathinfo.path, &st)==-1) {
 
 	/* entry does not exist in the underlying fs */
 
-	entry=find_entry_table(parent, name, 1);
+	entry=find_entry(parent, name);
 
 	if ( entry ) {
+	    unsigned int row=0;
 
 	    inode=entry->inode;
-
-	    remove_entry_from_name_hash(entry);
-	    remove_entry(entry);
-
 	    inode->alias=NULL;
 
+	    delete_entry_sl(entry, &row, &error);
+	    remove_entry(entry);
+
 	}
 
-	nreturn=-ENOENT;
+	error=ENOENT;
 
     } else {
-	struct entry_struct *entry;
 
-	entry=find_entry_table(parent, name, 1);
+	entry=find_entry(parent, name);
 
 	if ( ! entry ) {
+	    unsigned int row=0;
 
-	    entry=create_entry(parent, name, NULL);
+	    entry=insert_entry_sl(parent, name, &row, &error, create_entry_cb, NULL);
 
-	    if (entry) {
-
-		assign_inode(entry);
-
-		if (! entry->inode) {
-
-		    remove_entry(entry);
-		    nreturn=-ENOMEM;
-		    goto out;
-
-		}
-
-		inodecreated=1;
-
-	    } else {
-
-		nreturn=-ENOMEM;
-		goto out;
-
-	    }
-
-	    add_to_name_hash_table(entry);
-	    add_to_inode_hash_table(entry->inode);
+	    adjust_pathmax(call_info.pathinfo.len);
 
 	}
-
-	inode=entry->inode;
 
     }
 
     out:
 
-    if ( nreturn==-ENOENT) {
+    if ( error==ENOENT) {
 
-	logoutput("lookup: entry does not exist (ENOENT)");
+	logoutput("overlayfs_lookup: entry %s does not exist (ENOENT)", name);
 
-	e.ino = 0;
-	e.entry_timeout = overlayfs_options.negative_timeout;
+	fuse_reply_err(req, error);
 
-    } else if ( nreturn<0 ) {
+    } else if ( error>0 ) {
 
-	logoutput("do_lookup: error (%i)", nreturn);
+	logoutput("overlayfs_lookup: error (%i)", error);
+
+	fuse_reply_err(req, error);
 
     } else {
 
-	// no error
-
+	inode=entry->inode;
 	inode->nlookup++;
+
 	e.ino = inode->ino;
-	e.attr.st_ino = e.ino;
-	e.generation = 0;
+	e.generation = 1;
 	e.attr_timeout = overlayfs_options.attr_timeout;
 	e.entry_timeout = overlayfs_options.entry_timeout;
 
-	copy_stat(&inode->st, &e.attr);
+	e.attr.st_ino = e.ino;
+	e.attr.st_mode = st.st_mode;
+	e.attr.st_nlink = st.st_nlink;
+	e.attr.st_uid = st.st_uid;
+	e.attr.st_gid = st.st_gid;
+	e.attr.st_rdev = st.st_rdev;
+	e.attr.st_atim.tv_sec = st.st_atim.tv_sec;
+	e.attr.st_atim.tv_nsec = st.st_atim.tv_nsec;
+	e.attr.st_mtim.tv_sec = st.st_mtim.tv_sec;
+	e.attr.st_mtim.tv_nsec = st.st_mtim.tv_nsec;
+	e.attr.st_ctim.tv_sec = st.st_ctim.tv_sec;
+	e.attr.st_ctim.tv_nsec = st.st_ctim.tv_nsec;
 
-	if (S_ISDIR(inode->st.st_mode)) {
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
 
-	    if (inodecreated==1) {
+	inode->mode=st.st_mode;
+	inode->nlink=st.st_nlink;
+	inode->uid=st.st_uid;
+	inode->gid=st.st_gid;
 
-		/* when a directory is found for the first time, it's not synced yet 
-		    by setting this to zero: make sure it's synced */
+	inode->rdev=st.st_rdev;
 
-		inode->st.st_mtim.tv_sec=0;
-		inode->st.st_mtim.tv_nsec=0;
+	if (S_ISDIR(st.st_mode)) {
 
-	    }
-
+	    e.attr.st_size = 0;
 
 	} else {
 
-	    inode->st.st_mtim.tv_sec=e.attr.st_mtim.tv_sec;
-	    inode->st.st_mtim.tv_nsec=e.attr.st_mtim.tv_nsec;
+	    inode->type.size=st.st_size;
+	    e.attr.st_size = st.st_size;
 
 	}
 
-	inode->st.st_ctim.tv_sec=e.attr.st_ctim.tv_sec;
-	inode->st.st_ctim.tv_nsec=e.attr.st_ctim.tv_nsec;
+	inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
 
-	get_current_time(&inode->st.st_atim);
+	inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
 
-	logoutput("lookup: entry %s found", name);
+	fuse_reply_entry(req, &e);
 
-    }
-
-    if ( nreturn<0 ) {
-
-	fuse_reply_err(req, -nreturn);
-
-    } else {
-
-        fuse_reply_entry(req, &e);
+	logoutput("overlayfs_lookup: entry %s found", name);
 
     }
 
@@ -312,23 +292,38 @@ static void overlayfs_forget(fuse_req_t req, fuse_ino_t ino, unsigned long nlook
 {
     struct inode_struct *inode;
 
-    inode = find_inode_generic(ino);
-    if ( ! inode ) goto out;
-
     logoutput("FORGET");
 
-    if ( inode->nlookup < nlookup ) {
+    inode = remove_inode(ino);
 
-	logoutput("internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
-	inode->nlookup=0;
+    if (inode) {
 
-    } else {
+	if (inode->alias) {
+	    struct entry_struct *entry=inode->alias;
 
-        inode->nlookup -= nlookup;
+	    logoutput("forget, entry %s does still exist", entry->name);
+
+	} else {
+	    if ( inode->nlookup < nlookup ) {
+
+		logoutput("internal error: forget ino=%llu %llu from %llu", (unsigned long long) ino, (unsigned long long) nlookup, (unsigned long long) inode->nlookup);
+		inode->nlookup=0;
+
+	    } else {
+
+    		inode->nlookup -= nlookup;
+
+		logoutput("forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
+
+	    }
+
+	    free(inode);
+
+	    decrease_nrinodes();
+
+	}
 
     }
-
-    logoutput("forget, current nlookup value %llu", (unsigned long long) inode->nlookup);
 
     out:
 
@@ -341,17 +336,17 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     struct stat st;
     struct entry_struct *entry;
     struct inode_struct *inode;
-    int nreturn=0;
     struct call_info_struct call_info=CALL_INFO_INIT;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    unsigned int error=0;
 
     logoutput("GETATTR");
 
-    inode=find_inode_generic(ino);
+    inode=find_inode(ino);
 
     if ( ! inode ) {
 
-	nreturn=-ENOENT;
+	error=ENOENT;
 	goto out;
 
     }
@@ -360,7 +355,7 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     if ( ! entry ) {
 
-	nreturn=-ENOENT;
+	error=ENOENT;
 	goto out;
 
     }
@@ -381,43 +376,47 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
     } else {
 
-	nreturn=get_path(&call_info, NULL);
-	if (nreturn<0) goto out;
+	if (get_path(&call_info, &error)==-1) goto out;
 
     }
 
     /* check entry on underlying fs 
 	just the root for now (no prefix)*/
 
-    nreturn=lstat(call_info.pathinfo.path, &st);
-
-    if (nreturn==-1) nreturn=-errno;
+    if (lstat(call_info.pathinfo.path, &st)==-1) error=errno;
 
     out:
 
-    logoutput("getattr, return: %i", nreturn);
+    logoutput("overlayfs_getattr, return: %i", error);
 
-    if (nreturn < 0) {
+    if (error>0) {
 
-	//if (nreturn==-ENOENT) 
-
-	fuse_reply_err(req, -nreturn);
+	fuse_reply_err(req, error);
 
     } else {
 
-	copy_stat(&inode->st, &st);
+	inode->mode=st.st_mode;
+	inode->nlink=st.st_nlink;
+	inode->uid=st.st_uid;
+	inode->gid=st.st_gid;
 
-	if (! S_ISDIR(inode->st.st_mode)) {
+	inode->rdev=st.st_rdev;
 
-	    inode->st.st_mtim.tv_sec=st.st_mtim.tv_sec;
-	    inode->st.st_mtim.tv_nsec=st.st_mtim.tv_nsec;
+	if (S_ISDIR(st.st_mode)) {
+
+	    st.st_size=0;
+
+	} else {
+
+	    inode->type.size=st.st_size;
 
 	}
 
-	inode->st.st_ctim.tv_sec=st.st_ctim.tv_sec;
-	inode->st.st_ctim.tv_nsec=st.st_ctim.tv_nsec;
+	inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
 
-	get_current_time(&inode->st.st_atim);
+	inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
 
 	fuse_reply_attr(req, &st, overlayfs_options.attr_timeout);
 
@@ -427,315 +426,251 @@ static void overlayfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
 }
 
-static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t parentino, const char *name, mode_t mode)
+static void overlayfs_mkdir(fuse_req_t req, fuse_ino_t ino, const char *name, mode_t mode)
 {
-    struct fuse_entry_param e;
-    struct entry_struct *entry;
-    int nreturn=0;
-    unsigned char entrycreated=0;
-    struct call_info_struct call_info=CALL_INFO_INIT;
-    uid_t uid_keep;
-    gid_t gid_keep;
-    mode_t umask_keep;
+    struct entry_struct *entry=NULL;
+    struct inode_struct *inode;
+    unsigned int error=0;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("MKDIR, name: %s", name);
 
-    entry=find_entry_generic(parentino, name);
+    inode=find_inode(ino);
 
-    if ( ! entry ) {
-        struct inode_struct *pinode;
+    if (inode) {
+	struct entry_struct *parent=inode->alias;
 
-	pinode=find_inode_generic(parentino);
+	entry=find_entry(parent, name);
 
-	if ( pinode ) {
-            struct entry_struct *parent=pinode->alias;
+	if ( ! entry ) {
+	    struct call_info_struct call_info=CALL_INFO_INIT;
+	    uid_t uid_keep;
+	    gid_t gid_keep;
+	    mode_t umask_keep;
 
-	    if (parent) {
+	    call_info.entry=entry;
+	    call_info.pid=ctx->pid;
+	    call_info.uid=ctx->uid;
+	    call_info.gid=ctx->gid;
+	    call_info.umask=ctx->umask;
 
-		entry=create_entry(parent, name, NULL);
+	    call_info.pathinfo.path=NULL;
+	    call_info.pathinfo.len=0;
+	    call_info.pathinfo.flags=0;
 
-		if ( !entry ) {
+	    if (get_path_extra(&call_info, name, &error)==0) {
 
-		    nreturn=-ENOMEM;
-		    goto error;
+		/* change to uid/gid/umask of user */
+
+		uid_keep=setfsuid(call_info.uid);
+		gid_keep=setfsgid(call_info.gid);
+		umask_keep=umask(call_info.umask);
+
+		if (mkdir(call_info.pathinfo.path, mode)==0) {
+		    unsigned int row=0;
+
+		    entry=insert_entry_sl(parent, name, &row, &error, create_entry_cb, NULL);
+
+		    adjust_pathmax(call_info.pathinfo.len);
+
+		} else {
+
+		    error=errno;
 
 		}
 
-		entrycreated=1;
-
-	    } else {
-
-		nreturn=-ENOENT;
-		goto error;
+		uid_keep=setfsuid(uid_keep);
+		gid_keep=setfsgid(gid_keep);
+		umask_keep=umask(umask_keep);
 
 	    }
 
-	} else { 
+	    free_path_pathinfo(&call_info.pathinfo);
 
-	    nreturn=-ENOENT;
-	    goto error;
+	} else {
+
+	    error=EEXIST;
 
 	}
 
     } else {
 
-	/* here an error, the entry does exist already */
-
-	nreturn=-EEXIST;
-	goto error;
+	error=ENOENT;
 
     }
-
-    call_info.entry=entry;
-    call_info.pid=ctx->pid;
-    call_info.uid=ctx->uid;
-    call_info.gid=ctx->gid;
-    call_info.umask=ctx->umask;
-
-    call_info.pathinfo.path=NULL;
-    call_info.pathinfo.len=0;
-    call_info.pathinfo.flags=0;
-
-    nreturn=get_path(&call_info, NULL);
-    if ( nreturn<0) goto out;
-
-    /* change to uid/gid/umask of user */
-
-    uid_keep=setfsuid(call_info.uid);
-    gid_keep=setfsgid(call_info.gid);
-    umask_keep=umask(call_info.umask);
-
-    nreturn=mkdir(call_info.pathinfo.path, mode);
-
-    /* change back */
-
-    uid_keep=setfsuid(uid_keep);
-    gid_keep=setfsgid(gid_keep);
-    umask_keep=umask(umask_keep);
 
     out:
 
-    if ( nreturn==0 ) {
-	struct inode_struct *inode;
-
-        assign_inode(entry);
+    if ( error==0 ) {
+        struct fuse_entry_param e;
+    
+	memset(&e, 0, sizeof(&e));
 
 	inode=entry->inode;
 
-        if ( ! inode ) {
-
-            nreturn=-ENOMEM;
-            goto error;
-
-        }
-
 	e.ino = inode->ino;
 	e.attr.st_ino = e.ino;
-	e.generation = 0;
+	e.attr.st_mode = mode;
+	e.generation = 1;
 	e.attr_timeout = overlayfs_options.attr_timeout;
 	e.entry_timeout = overlayfs_options.entry_timeout;
 
-	inode->st.st_mode=S_IFDIR;
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
 
-        add_to_name_hash_table(entry);
-	add_to_inode_hash_table(entry->inode);
+	inode->mode=S_IFDIR;
+
+	inode->nlink=0;
+	inode->uid=ctx->uid;
+	inode->gid=ctx->gid;
+
+	inode->rdev=0;
+	inode->type.directory=NULL;
+
+	inode->mtim.tv_sec=0;
+	inode->mtim.tv_nsec=0;
+
+	inode->ctim.tv_sec=0;
+	inode->ctim.tv_nsec=0;
 
         fuse_reply_entry(req, &e);
 
-	free_path_pathinfo(&call_info.pathinfo);
+    } else {
 
-        return;
+	logoutput("overlayfs_mkdir: error %i", error);
+
+	fuse_reply_err(req, error);
 
     }
 
-    error:
-
-    logoutput("mkdir: error %i", nreturn);
-
-    if ( entrycreated==1 ) remove_entry(entry);
-
-    e.ino = 0;
-    e.entry_timeout = overlayfs_options.negative_timeout;
-
-    fuse_reply_err(req, abs(nreturn));
-
-    free_path_pathinfo(&call_info.pathinfo);
-
 }
 
-
-static void overlayfs_mknod(fuse_req_t req, fuse_ino_t parentino, const char *name, mode_t mode, dev_t rdev)
+static void overlayfs_mknod(fuse_req_t req, fuse_ino_t ino, const char *name, mode_t mode, dev_t rdev)
 {
-    struct fuse_entry_param e;
-    struct entry_struct *entry;
-    int nreturn=0;
-    unsigned char entrycreated=0;
-    struct call_info_struct call_info=CALL_INFO_INIT;
-    uid_t uid_keep;
-    gid_t gid_keep;
-    mode_t umask_keep;
+    struct entry_struct *entry=NULL;
+    struct inode_struct *inode;
+    unsigned int error=0;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("MKNOD, name: %s", name);
 
-    entry=find_entry_generic(parentino, name);
+    inode=find_inode(ino);
 
-    if ( ! entry ) {
-        struct inode_struct *pinode;
+    if (inode) {
+	struct entry_struct *parent=inode->alias;
 
-	pinode=find_inode_generic(parentino);
+	entry=find_entry(parent, name);
 
-	if ( pinode ) {
-            struct entry_struct *parent=pinode->alias;
+	if ( ! entry ) {
+	    struct call_info_struct call_info=CALL_INFO_INIT;
+	    uid_t uid_keep;
+	    gid_t gid_keep;
+	    mode_t umask_keep;
 
-	    if (parent) {
+	    call_info.entry=entry;
+	    call_info.pid=ctx->pid;
+	    call_info.uid=ctx->uid;
+	    call_info.gid=ctx->gid;
+	    call_info.umask=ctx->umask;
 
-		entry=create_entry(parent, name, NULL);
+	    call_info.pathinfo.path=NULL;
+	    call_info.pathinfo.len=0;
+	    call_info.pathinfo.flags=0;
 
-		if ( !entry ) {
+	    if (get_path_extra(&call_info, name, &error)==0) {
 
-		    nreturn=-ENOMEM;
-		    goto error;
+		/* change to uid/gid/umask of user */
+
+		uid_keep=setfsuid(call_info.uid);
+		gid_keep=setfsgid(call_info.gid);
+		umask_keep=umask(call_info.umask);
+
+		if (mknod(call_info.pathinfo.path, mode, rdev)==0) {
+		    unsigned int row=0;
+
+		    entry=insert_entry_sl(parent, name, &row, &error, create_entry_cb, NULL);
+
+		    adjust_pathmax(call_info.pathinfo.len);
+
+		} else {
+
+		    error=errno;
 
 		}
 
-		entrycreated=1;
-
-	    } else {
-
-		nreturn=-ENOENT;
-		goto error;
+		uid_keep=setfsuid(uid_keep);
+		gid_keep=setfsgid(gid_keep);
+		umask_keep=umask(umask_keep);
 
 	    }
 
-	} else { 
+	    free_path_pathinfo(&call_info.pathinfo);
 
-	    nreturn=-ENOENT;
-	    goto error;
+	} else {
+
+	    error=EEXIST;
 
 	}
 
-    } else {
-
-	/* here an error, the entry does exist already */
-
-	nreturn=-EEXIST;
-	goto error;
-
     }
-
-
-    call_info.entry=entry;
-    call_info.pid=ctx->pid;
-    call_info.uid=ctx->uid;
-    call_info.gid=ctx->gid;
-    call_info.umask=ctx->umask;
-
-    call_info.pathinfo.path=NULL;
-    call_info.pathinfo.len=0;
-    call_info.pathinfo.flags=0;
-
-    nreturn=get_path(&call_info, NULL);
-    if ( nreturn<0) goto out;
-
-    /* change to uid/gid/umask of user */
-
-    uid_keep=setfsuid(call_info.uid);
-    gid_keep=setfsgid(call_info.gid);
-    umask_keep=umask(call_info.umask);
-
-    nreturn=mknod(call_info.pathinfo.path, mode, rdev);
-
-    /* change back */
-
-    uid_keep=setfsuid(uid_keep);
-    gid_keep=setfsgid(gid_keep);
-    umask_keep=umask(umask_keep);
 
     out:
 
-    if ( nreturn==0 ) {
-	struct inode_struct *inode;
+    if ( error==0 ) {
+        struct fuse_entry_param e;
 
-        assign_inode(entry);
+	memset(&e, 0, sizeof(&e));
 
 	inode=entry->inode;
 
-        if ( ! inode ) {
-
-            nreturn=-ENOMEM;
-            goto error;
-
-        }
-
 	e.ino = inode->ino;
 	e.attr.st_ino = e.ino;
-	e.generation = 0;
+	e.attr.st_mode = mode;
+	e.attr.st_rdev = rdev;
+	e.generation = 1;
 	e.attr_timeout = overlayfs_options.attr_timeout;
 	e.entry_timeout = overlayfs_options.entry_timeout;
 
-	inode->st.st_mode=mode;
-	inode->st.st_rdev=rdev;
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
 
-        add_to_name_hash_table(entry);
-	add_to_inode_hash_table(entry->inode);
+	inode->mode=mode;
 
-        logoutput("mkdir: successfull");
+	inode->nlink=0;
+	inode->uid=ctx->uid;
+	inode->gid=ctx->gid;
+
+	inode->rdev=rdev;
+	inode->type.size=0;
+
+	inode->mtim.tv_sec=0;
+	inode->mtim.tv_nsec=0;
+
+	inode->ctim.tv_sec=0;
+	inode->ctim.tv_nsec=0;
 
         fuse_reply_entry(req, &e);
 
-	free_path_pathinfo(&call_info.pathinfo);
+    } else {
 
-        return;
+	logoutput("overlayfs_mknod: error %i", error);
+
+	fuse_reply_err(req, error);
 
     }
 
-    error:
-
-    logoutput("mkdir: error %i", nreturn);
-
-    if ( entrycreated==1 ) remove_entry(entry);
-
-    e.ino = 0;
-    e.entry_timeout = overlayfs_options.negative_timeout;
-
-    fuse_reply_err(req, abs(nreturn));
-
-    free_path_pathinfo(&call_info.pathinfo);
 }
 
 static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
 {
-    struct entry_struct *entry;
     struct inode_struct *inode;
-    int nreturn=0;
-    struct call_info_struct call_info=CALL_INFO_INIT;
-    size_t size=512;
-    char *buff=NULL;
+    unsigned int error=0;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct call_info_struct call_info=CALL_INFO_INIT;
 
     logoutput("READLINK");
 
-    inode=find_inode_generic(ino);
-
-    if ( ! inode ) {
-
-	nreturn=-ENOENT;
-	goto out;
-
-    }
-
-    entry=inode->alias;
-
-    if ( ! entry ) {
-
-	nreturn=-ENOENT;
-	goto out;
-
-    }
-
-    call_info.entry=entry;
+    call_info.entry=NULL;
     call_info.pid=ctx->pid;
     call_info.uid=ctx->uid;
     call_info.gid=ctx->gid;
@@ -745,188 +680,167 @@ static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
     call_info.pathinfo.len=0;
     call_info.pathinfo.flags=0;
 
-    if (isrootentry(entry)==1) {
+    inode=find_inode(ino);
 
-	call_info.pathinfo.path=(char *)rootpath;
+    if ( inode ) {
+	struct entry_struct *entry;
 
-    } else {
+	entry=inode->alias;
 
-	nreturn=get_path(&call_info, NULL);
-	if (nreturn<0) goto out;
+	if ( entry ) {
+	    size_t size=512;
+	    char *buff=NULL;
 
-    }
+	    call_info.entry=entry;
 
-    while(1) {
-	uid_t uid_keep;
-	gid_t gid_keep;
-	mode_t umask_keep;
-	int res;
+	    if (isrootentry(entry)==1) {
 
-	if (buff) {
+		call_info.pathinfo.path=(char *)rootpath;
 
-	    buff = realloc(buff, size);
+	    } else {
+
+		if (get_path(&call_info, &error)==-1) goto out;
+
+	    }
+
+	    while(size<=PATH_MAX) {
+		uid_t uid_keep;
+		gid_t gid_keep;
+		ssize_t lenread=0;
+
+		if (buff) {
+
+		    buff = realloc(buff, size);
+
+		} else {
+
+		    buff = malloc(size);
+
+		}
+
+		if ( buff ) {
+
+		    uid_keep=setfsuid(call_info.uid);
+		    gid_keep=setfsgid(call_info.gid);
+
+    		    if ((lenread=readlink(call_info.pathinfo.path, buff, size))==-1) {
+
+			error=errno;
+
+			setfsuid(uid_keep);
+			setfsgid(gid_keep);
+
+			free(buff);
+			goto out;
+
+		    }
+
+		    setfsuid(uid_keep);
+		    setfsgid(gid_keep);
+
+		    if (lenread < size) {
+
+			/* success */
+
+			buff[lenread] = '\0';
+			fuse_reply_readlink(req, buff);
+
+			logoutput("overlayfs_readlink: read link %s for %s", buff, entry->name);
+
+			free(buff);
+			free_path_pathinfo(&call_info.pathinfo);
+
+			return;
+
+		    }
+
+		    size+=512;
+
+		} else {
+
+		    error=ENOMEM;
+		    break;
+
+		}
+
+	    }
 
 	} else {
 
-	    buff = malloc(size);
+	    error=ENOENT;
 
 	}
-
-	if (! buff ) {
-
-	    nreturn=-ENOMEM;
-	    goto out;
-
-	}
-
-	uid_keep=setfsuid(call_info.uid);
-	gid_keep=setfsgid(call_info.gid);
-
-    	res = readlink(call_info.pathinfo.path, buff, size);
-	if ( res==-1) nreturn=-errno;
-
-	setfsuid(uid_keep);
-	setfsgid(gid_keep);
-
-	if (nreturn<0) {
-
-	    break;
-
-	} else if (res < size) {
-
-	    buff[res] = '\0';
-	    break;
-
-	}
-
-	size *= 2;
 
     }
 
     out:
 
-    logoutput("readlink, return: %i", nreturn);
+    logoutput("overlayfs_readlink: error %i", error);
 
-    if (nreturn < 0) {
-
-	fuse_reply_err(req, -nreturn);
-
-    } else {
-
-	fuse_reply_readlink(req, buff);
-
-    }
+    fuse_reply_err(req, error);
 
     free_path_pathinfo(&call_info.pathinfo);
 
-    if (buff) {
-
-	free(buff);
-	buff=NULL;
-
-    }
-
 }
 
-void remove_children_entry(struct entry_struct *parent)
+void remove_old_entries(struct entry_struct *parent, struct timespec *synctime)
 {
-    struct entry_struct *entry, *next_entry;
+    struct entry_struct *entry;
 
-    entry=get_next_entry(parent, NULL);
-
-    while(entry) {
-
-	next_entry=entry=get_next_entry(parent, entry);
-
-	if (S_ISDIR(entry->inode->st.st_mode)) remove_children_entry(entry);
-
-	/* if a watch has been set here: remove that one.. and send notifyfs a message */
-
-	notify_kernel_delete(entry);
-
-	remove_entry_from_name_hash(entry);
-	remove_entry(entry);
-
-	entry=next_entry;
-
-    }
-
-}
-
-void remove_old_entries(struct entry_struct *parent, struct timespec *sync_time)
-{
-    struct entry_struct *entry, *next_entry;
-    struct inode_struct *parent_inode, *inode;
-
-    logoutput("remove_old_entries");
-
-    parent_inode=parent->inode;
+    logoutput("remove_old_entries: synctime %li:%li", synctime->tv_sec, synctime->tv_nsec);
 
     entry=get_next_entry(parent, NULL);
 
     while (entry) {
 
-	next_entry=get_next_entry(parent, entry);
+	if (entry->synctime.tv_sec<synctime->tv_sec || 
+	    (entry->synctime.tv_sec==synctime->tv_sec && entry->synctime.tv_nsec<synctime->tv_nsec)) {
+	    struct entry_struct *next_entry=get_next_entry(parent, entry);
+	    unsigned int row=0;
+	    unsigned int error=0;
+	    struct inode_struct *inode=entry->inode;
 
-	inode=entry->inode;
+	    logoutput("remove_old_entries: remove %s", entry->name);
 
-	if (inode->st.st_atim.tv_sec<sync_time->tv_sec || 
-	    (inode->st.st_atim.tv_sec==sync_time->tv_sec && inode->st.st_atim.tv_nsec<sync_time->tv_nsec)) {
+	    if (S_ISDIR(inode->mode)) remove_directory_recursive(entry);
 
-	    /* if directory remove recursivly ... it's required to know it's a directory ... */
+	    notify_kernel_delete(parent->inode->ino, inode->ino, entry->name);
 
-	    if (S_ISDIR(inode->st.st_mode)) remove_children_entry(entry);
-
-	    /* if a watch has been set here: remove that one.. and send notifyfs a message */
-
-	    notify_kernel_delete(entry);
-
-	    remove_entry_from_name_hash(entry);
+	    delete_entry_sl(entry, &row, &error);
 	    remove_entry(entry);
 
-	    /* TODO:
-	    signal to notifyfs when a watch has been removed.. */
+	    entry=next_entry;
+
+	} else {
+
+	    entry=get_next_entry(parent, entry);
 
 	}
-
-	entry=next_entry;
 
     }
 
 }
 
+#define _GETDENTS_BUFFSIZE				1024
+
+struct linux_dirent {
+    unsigned long				d_ino;
+    unsigned long				d_off;
+    unsigned short				d_reclen;
+    char					d_name[];
+};
+
 static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    struct generic_dirp_struct *generic_dirp=NULL;
-    int nreturn=0;
+    struct overlayfs_dirp_struct *overlayfs_dirp=NULL;
+    unsigned int error=0;
     struct entry_struct *entry;
     struct inode_struct *inode;
     struct call_info_struct call_info=CALL_INFO_INIT;
-    DIR *dp=NULL;
-    struct stat st;
     const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
     logoutput("OPENDIR");
 
-    inode=find_inode_generic(ino);
-
-    if ( ! inode ) {
-
-	nreturn=-ENOENT;
-	goto out;
-
-    }
-
-    entry=inode->alias;
-
-    if ( ! entry ) {
-
-	nreturn=-ENOENT;
-	goto out;
-
-    }
-
-    call_info.entry=entry;
     call_info.pid=ctx->pid;
     call_info.uid=ctx->uid;
     call_info.gid=ctx->gid;
@@ -936,397 +850,917 @@ static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     call_info.pathinfo.len=0;
     call_info.pathinfo.flags=0;
 
-    if (isrootentry(entry)==1) {
+    inode=find_inode(ino);
 
-	call_info.pathinfo.path=(char *)rootpath;
+    if (inode) {
 
-    } else {
+	entry=inode->alias;
 
-	nreturn=get_path(&call_info, NULL);
-	if (nreturn<0) goto out;
+	if ( entry ) {
+	    struct stat st;
+	    struct directory_struct *directory=NULL;
+	    int fd=0;
 
-    }
+	    call_info.entry=entry;
 
-    if (stat(call_info.pathinfo.path, &st)==-1) {
+	    if (isrootentry(entry)==1) {
 
-	/* handle error here */
+		call_info.pathinfo.path=(char *)rootpath;
 
-	nreturn=-errno;
-	goto out;
+	    } else {
 
-    }
-
-    generic_dirp = malloc(sizeof(struct generic_dirp_struct));
-
-    if ( ! generic_dirp ) {
-
-	nreturn=-ENOMEM;
-	goto out;
-
-    }
-
-    generic_dirp->parent=entry;
-    generic_dirp->upperfs_offset=0;
-    generic_dirp->name=NULL;
-    generic_dirp->virtual=1;
-
-    /* compare the modification time of the directory with the cached value 
-       if they directory has changed, this mod. time is newer than the cached on
-       take into account the directory must have been cached before
-    */
-
-    if (st.st_mtim.tv_sec>inode->st.st_mtim.tv_sec || (st.st_mtim.tv_sec==inode->st.st_mtim.tv_sec && st.st_mtim.tv_nsec>inode->st.st_mtim.tv_nsec)) {
-
-	/* fs directory has changed compared to cache */
-
-	generic_dirp->virtual=0;
-
-    }
-
-    copy_stat(&inode->st, &st);
-
-    inode->st.st_mtim.tv_sec=st.st_mtim.tv_sec;
-    inode->st.st_mtim.tv_nsec=st.st_mtim.tv_nsec;
-
-    inode->st.st_ctim.tv_sec=st.st_ctim.tv_sec;
-    inode->st.st_ctim.tv_nsec=st.st_ctim.tv_nsec;
-
-    if (generic_dirp->virtual==0) {
-
-	/* open directory */
-
-	generic_dirp->data=(void *)opendir(call_info.pathinfo.path);
-
-	if ( ! generic_dirp->data) {
-
-	    nreturn=-errno;
-	    goto out;
-
-	}
-
-    }
-
-    get_current_time(&inode->st.st_atim);
-
-    /* assign this generic dirp object to fi->fh */
-
-    fi->fh = (unsigned long) generic_dirp;
-
-    out:
-
-    if ( nreturn<0 ) {
-
-	if (generic_dirp) {
-
-	    if (generic_dirp->data) {
-
-		closedir((DIR *)generic_dirp->data);
-		generic_dirp->data=NULL;
+		if (get_path(&call_info, &error)==-1) goto error;
 
 	    }
 
-	    free(generic_dirp);
-	    generic_dirp=NULL;
+	    fd=open(call_info.pathinfo.path, O_RDONLY | O_DIRECTORY);
+
+	    if (fd==-1) {
+
+		error=errno;
+		goto error;
+
+	    }
+
+	    if (fstat(fd, &st)==-1) {
+
+		error=errno;
+		goto error;
+
+	    } else if (! S_ISDIR(st.st_mode)) {
+
+		error=ENOTDIR;
+		goto error;
+
+	    }
+
+	    overlayfs_dirp = malloc(sizeof(struct overlayfs_dirp_struct));
+
+	    if ( ! overlayfs_dirp ) {
+
+		error=ENOMEM;
+		goto error;
+
+	    }
+
+	    overlayfs_dirp->parent=entry;
+	    overlayfs_dirp->entry=NULL;
+	    overlayfs_dirp->offset=0;
+	    overlayfs_dirp->mode=0;
+	    overlayfs_dirp->fd=fd;
+	    overlayfs_dirp->buffer=NULL;
+	    overlayfs_dirp->size=0;
+	    overlayfs_dirp->pos=0;
+	    overlayfs_dirp->read=0;
+	    overlayfs_dirp->lenpath=call_info.pathinfo.len;
+
+	    directory=get_directory_sl(entry, 1, &error);
+
+	    if (! directory || error>0) {
+
+		error=(error==0) ? ENOMEM : error;
+		goto error;
+
+	    }
+
+	    /*
+		check the modification time of the directory
+		if changed after latest synctime then a full readdir is required 
+	    */
+
+	    logoutput("overlayfs_opendir: compare modifytime %li:%li with synctime %li:%li", st.st_mtim.tv_sec, st.st_mtim.tv_nsec, directory->synctime.tv_sec, directory->synctime.tv_nsec);
+
+	    if (st.st_mtim.tv_sec>directory->synctime.tv_sec || 
+		(st.st_mtim.tv_sec==directory->synctime.tv_sec && st.st_mtim.tv_nsec>directory->synctime.tv_nsec)) {
+
+		overlayfs_dirp->buffer=malloc(_GETDENTS_BUFFSIZE);
+
+		if ( ! overlayfs_dirp->buffer) {
+
+		    error=ENOMEM;
+		    goto error;
+
+		}
+
+		overlayfs_dirp->size=_GETDENTS_BUFFSIZE;
+
+		get_current_time(&overlayfs_dirp->synctime);
+
+	    } else {
+
+		overlayfs_dirp->mode |= _OVERLAYFS_MODE_VIRTUAL;
+
+	    }
+
+	    inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	    inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+	    inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	    inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+	    fi->fh = (uint64_t) overlayfs_dirp;
+
+	    fuse_reply_open(req, fi);
+
+	    add_pathcache(&call_info.pathinfo, entry);
+
+	    free_path_pathinfo(&call_info.pathinfo);
+
+	    return;
+
+	} else {
+
+	    error=ENOENT;
 
 	}
 
-	fuse_reply_err(req, -nreturn);
-
     } else {
 
-	fuse_reply_open(req, fi);
+	error=ENOENT;
 
     }
 
-    logoutput("opendir, nreturn %i", nreturn);
+    error:
+
+    fuse_reply_err(req, error);
+
+    if (overlayfs_dirp) {
+
+	if (overlayfs_dirp->fd>0) {
+
+	    close(overlayfs_dirp->fd);
+	    overlayfs_dirp->fd=0;
+
+	}
+
+    }
+
+    logoutput("overlayfs_opendir, error %i", error);
 
     free_path_pathinfo(&call_info.pathinfo);
 
 }
 
-static void overlayfs_readdir_virtual(fuse_req_t req, size_t size, off_t offset, struct generic_dirp_struct *generic_dirp)
+static void overlayfs_readdir_virtual(fuse_req_t req, size_t size, off_t offset, struct overlayfs_dirp_struct *overlayfs_dirp)
 {
-    char *buff=NULL;
-    size_t buffpos=0;
-    int nreturn=0;
-    size_t entsize;
-    struct entry_struct *entry=NULL;
+    unsigned int error=0;
 
     logoutput("READDIR virtual, size: %zi", size);
 
-    if (generic_dirp->data) {
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_FINISH) {
 
-	entry=(struct entry_struct *) generic_dirp->data;
+	fuse_reply_buf(req, NULL, 0);
+	return;
 
-    }
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct stat st;
+	char *name=NULL;
 
-    if (generic_dirp->upperfs_offset>1 && ! entry) goto out;
+	memset(&st, 0, sizeof(struct stat));
 
-    buff=malloc(size);
+	buff=malloc(size);
 
-    if (! buff) {
+	if (! buff) {
 
-	nreturn=-ENOMEM;
-	goto out;
+	    error=ENOMEM;
+	    goto error;
 
-    }
+	}
 
-    while (buffpos<size) {
+	while (pos<size) {
 
-        if (generic_dirp->upperfs_offset==0) {
-	    struct inode_struct *inode=generic_dirp->parent->inode;
+    	    if (overlayfs_dirp->offset==0) {
+		struct inode_struct *inode=overlayfs_dirp->parent->inode;
 
-            /* the . entry */
+        	/* the . entry */
 
-            generic_dirp->st.st_ino = inode->ino;
-	    generic_dirp->st.st_mode=S_IFDIR;
-	    generic_dirp->name=(char *) dotname;
+        	st.st_ino = inode->ino;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotname;
 
-        } else if (generic_dirp->upperfs_offset==1) {
+    	    } else if (overlayfs_dirp->offset==1) {
 
-            /* the .. entry */
+        	/* the .. entry */
 
-	    if (isrootentry(generic_dirp->parent)==1 ) {
-		struct inode_struct *inode=generic_dirp->parent->inode;
+		if (isrootentry(overlayfs_dirp->parent)==1 ) {
+		    struct inode_struct *inode=overlayfs_dirp->parent->inode;
 
-	        generic_dirp->st.st_ino = inode->ino;
+	    	    st.st_ino = inode->ino;
 
-	    } else {
-		struct entry_struct *parent=generic_dirp->parent->parent;
-		struct inode_struct *inode=parent->inode;
+		} else {
+		    struct entry_struct *parent=overlayfs_dirp->parent->parent;
+		    struct inode_struct *inode=parent->inode;
 
-	        generic_dirp->st.st_ino=inode->ino;
+	    	    st.st_ino=inode->ino;
 
-	    }
+		}
 
-	    generic_dirp->st.st_mode=S_IFDIR;
-	    generic_dirp->name=(char *) dotdotname;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotdotname;
 
-        } else {
+		overlayfs_dirp->entry=get_next_entry(overlayfs_dirp->parent, NULL);
 
-	    if (buffpos>0) {
+    	    } else {
 
-		if (generic_dirp->upperfs_offset==2) {
+		if (overlayfs_dirp->entry) {
 
-		    entry=get_next_entry(generic_dirp->parent, NULL);
+		    name=overlayfs_dirp->entry->name;
+		    st.st_mode=overlayfs_dirp->entry->inode->mode;
+		    st.st_ino=overlayfs_dirp->entry->inode->ino;
 
 		} else {
 
-		    entry=get_next_entry(generic_dirp->parent, entry);
+		    overlayfs_dirp->mode |= _OVERLAYFS_MODE_FINISH;
+		    break;
 
 		}
 
 	    }
 
-	    if ( ! entry) {
+    	    dirent_size=fuse_add_direntry(req, buff+pos, size-pos, name, &st, overlayfs_dirp->offset+1);
 
-		generic_dirp->name=NULL;
-		generic_dirp->st.st_ino=0;
-		generic_dirp->st.st_mode=0;
-		generic_dirp->data=NULL;
+	    if (pos + dirent_size > size) {
 
 		break;
 
 	    }
 
-	    generic_dirp->name=entry->name;
-	    generic_dirp->st.st_ino=entry->inode->ino;
-	    generic_dirp->st.st_mode=entry->inode->st.st_mode;
+	    /* increase counter and clear the various fields */
 
-        }
-
-        entsize=fuse_add_direntry(req, buff+buffpos, size-buffpos, generic_dirp->name, &generic_dirp->st, generic_dirp->upperfs_offset);
-
-	if (buffpos+entsize > size) {
-
-	    /* this entry does not fit into buffer, remember it for next batch */
-
-	    generic_dirp->data=(void *) entry;
-	    break;
+	    overlayfs_dirp->entry=get_next_entry(overlayfs_dirp->parent, overlayfs_dirp->entry);
+	    overlayfs_dirp->offset++;
+	    pos += dirent_size;
 
 	}
 
-	/* increase counter and clear the various fields */
-
-        generic_dirp->upperfs_offset++;
-	generic_dirp->name=NULL;
-	generic_dirp->data=NULL;
-	generic_dirp->st.st_ino=0;
-	generic_dirp->st.st_mode=0;
-	buffpos += entsize;
-
-    }
-
-    out:
-
-    if (nreturn < 0 ) {
-
-	fuse_reply_err(req, -nreturn);
-
-    } else {
-
-	fuse_reply_buf(req, buff, buffpos);
-
-    }
-
-    if ( buff ) {
+	fuse_reply_buf(req, buff, pos);
 
 	free(buff);
 	buff=NULL;
 
+	return;
+
     }
+
+    error:
+
+    fuse_reply_err(req, error);
 
 }
 
-static void overlayfs_readdir_real(fuse_req_t req, size_t size, off_t offset, struct generic_dirp_struct *generic_dirp)
+static void overlayfs_readdir_real(fuse_req_t req, size_t size, off_t offset, struct overlayfs_dirp_struct *overlayfs_dirp)
 {
-    char *buff;
-    size_t buffpos=0;
-    int nreturn=0;
-    DIR *dp=(DIR *) generic_dirp->data;
-    struct dirent *de;
-    size_t entsize;
-    struct timespec *sync_time=NULL;
+    unsigned int error=0;
 
     logoutput("READDIR real, size: %zi", size);
 
-    buff=malloc(size);
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_FINISH) {
 
-    if (! buff) {
+	fuse_reply_buf(req, NULL, 0);
+	return;
 
-	nreturn=-ENOMEM;
-	goto out;
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct stat st;
+	char *name=NULL;
 
-    }
+	memset(&st, 0, sizeof(struct stat));
 
-    sync_time=&generic_dirp->parent->inode->st.st_atim;
+	buff=malloc(size);
 
-    while (buffpos<size) {
+	if (! buff) {
 
-	if (! generic_dirp->name) {
-
-	    de=readdir(dp);
-
-	    if ( ! de) break;
-
-	    generic_dirp->name=de->d_name;
-	    generic_dirp->st.st_mode=de->d_type<<12;
+	    error=ENOMEM;
+	    goto error;
 
 	}
 
-        if ( strcmp(de->d_name, ".")==0 ) {
-	    struct inode_struct *inode=generic_dirp->parent->inode;
+	while (pos<size) {
 
-            /* the . entry */
+    	    if (overlayfs_dirp->offset==0) {
+		struct inode_struct *inode=overlayfs_dirp->parent->inode;
 
-            generic_dirp->st.st_ino = inode->ino;
+        	/* the . entry */
 
-        } else if ( strcmp(de->d_name, "..")==0 ) {
+        	st.st_ino = inode->ino;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotname;
 
-            /* the .. entry */
+    	    } else if (overlayfs_dirp->offset==1) {
 
-	    if (isrootentry(generic_dirp->parent)==1 ) {
-		struct inode_struct *inode=generic_dirp->parent->inode;
+        	/* the .. entry */
 
-	        generic_dirp->st.st_ino = inode->ino;
+		if (isrootentry(overlayfs_dirp->parent)==1 ) {
+		    struct inode_struct *inode=overlayfs_dirp->parent->inode;
 
-	    } else {
-		struct entry_struct *parent=generic_dirp->parent->parent;
-		struct inode_struct *inode=parent->inode;
+	    	    st.st_ino = inode->ino;
 
-	        generic_dirp->st.st_ino=inode->ino;
+		} else {
+		    struct entry_struct *parent=overlayfs_dirp->parent->parent;
+		    struct inode_struct *inode=parent->inode;
+
+	    	    st.st_ino=inode->ino;
+
+		}
+
+		st.st_mode = S_IFDIR;
+		name = (char *) dotdotname;
+
+    	    } else {
+
+		if (! overlayfs_dirp->entry) {
+		    struct entry_struct *entry;
+		    unsigned int row=0;
+		    struct linux_dirent *de=NULL;
+		    unsigned char d_type=0;
+
+		    readdir:
+
+		    if (overlayfs_dirp->pos>=overlayfs_dirp->size) {
+			int nread=0;
+
+			nread=syscall(SYS_getdents, overlayfs_dirp->fd, overlayfs_dirp->buffer, overlayfs_dirp->size);
+
+			if (nread<=0) {
+
+			    if (nread==-1) {
+
+				error=errno;
+				free(buff);
+				goto error;
+
+			    }
+
+			    overlayfs_dirp->mode |= _OVERLAYFS_MODE_FINISH;
+			    break;
+
+			}
+
+			overlayfs_dirp->pos=0;
+
+		    }
+
+		    de=(struct linux_dirent *) (overlayfs_dirp->buffer + overlayfs_dirp->pos);
+
+		    if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) {
+
+			overlayfs_dirp->pos+=de->d_reclen;
+			goto readdir;
+
+		    }
+
+		    d_type=*(overlayfs_dirp->buffer + overlayfs_dirp->pos + de->d_reclen - 1);
+
+		    entry=find_entry_by_name_sl(overlayfs_dirp->parent, de->d_name, &row, &error);
+
+		    if (! entry) {
+
+			entry=insert_entry_sl(overlayfs_dirp->parent, de->d_name, &row, &error, create_entry_cb, NULL);
+
+			if (! entry) break;
+
+			memcpy(&entry->synctime, &overlayfs_dirp->synctime, sizeof(struct timespec));
+
+			entry->inode->mode=DTTOIF(d_type);
+
+			st.st_mode=entry->inode->mode;
+			st.st_ino=entry->inode->ino;
+			name=entry->name;
+
+		    } else {
+
+			st.st_ino=entry->inode->ino;
+			st.st_mode=entry->inode->mode;
+			name=entry->name;
+
+			memcpy(&entry->synctime, &overlayfs_dirp->synctime, sizeof(struct timespec));
+
+		    }
+
+		    overlayfs_dirp->entry=entry;
+
+		} else {
+
+		    st.st_ino=overlayfs_dirp->entry->inode->ino;
+		    st.st_mode=overlayfs_dirp->entry->inode->mode;
+		    name=overlayfs_dirp->entry->name;
+
+		}
 
 	    }
 
-        } else {
-	    struct entry_struct *entry;
+    	    dirent_size=fuse_add_direntry(req, buff+pos, size-pos, name, &st, overlayfs_dirp->offset+1);
 
-	    entry=find_entry_table(generic_dirp->parent, de->d_name, 1);
+	    if (pos + dirent_size > size) {
 
-	    if ( ! entry) {
+		break;
 
-		entry=create_entry(generic_dirp->parent, de->d_name, NULL);
+	    }
 
-		if (entry) {
+	    /* increase counter and clear the various fields */
 
-		    assign_inode(entry);
+	    overlayfs_dirp->entry=NULL; /* forget current entry to force readdir */
+	    overlayfs_dirp->offset++;
+	    pos += dirent_size;
 
-		    if ( ! entry->inode) {
+        }
 
-			remove_entry(entry);
-			entry=NULL;
+	fuse_reply_buf(req, buff, pos);
 
-			nreturn=-ENOMEM;
-			break;
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdirplus_virtual(fuse_req_t req, size_t size, off_t offset, struct overlayfs_dirp_struct *overlayfs_dirp)
+{
+    unsigned int error=0;
+
+    logoutput("READDIRPLUS virtual, size: %zi", size);
+
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct fuse_entry_param e;
+	char *name=NULL;
+
+	memset(&e, 0, sizeof(struct fuse_entry_param));
+
+	e.generation = 1;
+	e.attr_timeout = overlayfs_options.attr_timeout;
+	e.entry_timeout = overlayfs_options.entry_timeout;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (overlayfs_dirp->offset==0) {
+		struct inode_struct *inode=overlayfs_dirp->parent->inode;
+
+        	/* the . entry */
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotname;
+
+		inode->nlookup++;
+
+    	    } else if (overlayfs_dirp->offset==1) {
+    		struct inode_struct *inode=NULL;
+
+        	/* the .. entry */
+
+		if (isrootentry(overlayfs_dirp->parent)==1 ) {
+
+		    inode=overlayfs_dirp->parent->inode;
+
+		} else {
+
+		    inode=overlayfs_dirp->parent->parent->inode;
+
+		}
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotdotname;
+
+		inode->nlookup++;
+
+		overlayfs_dirp->entry=get_next_entry(overlayfs_dirp->parent, NULL);
+
+    	    } else {
+
+		if (overlayfs_dirp->entry) {
+		    struct inode_struct *inode=overlayfs_dirp->entry->inode;
+
+		    e.ino = inode->ino;
+
+		    e.attr.st_ino = e.ino;
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->type.size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    name=overlayfs_dirp->entry->name;
+
+		    inode->nlookup++;
+
+		    overlayfs_dirp->entry=get_next_entry(overlayfs_dirp->parent, overlayfs_dirp->entry);
+
+		} else {
+
+		    overlayfs_dirp->mode |= _OVERLAYFS_MODE_FINISH;
+		    break;
+
+		}
+
+	    }
+
+    	    dirent_size=fuse_add_direntry_plus(req, buff+pos, size-pos, name, &e, overlayfs_dirp->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    overlayfs_dirp->offset++;
+	    pos += dirent_size;
+
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdirplus_real(fuse_req_t req, size_t size, off_t offset, struct overlayfs_dirp_struct *overlayfs_dirp)
+{
+    unsigned int error=0;
+
+    logoutput("READDIRPLUS real, size: %zi", size);
+
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct fuse_entry_param e;
+	char *name=NULL;
+
+	memset(&e, 0, sizeof(struct fuse_entry_param));
+
+	e.generation = 1;
+	e.attr_timeout = overlayfs_options.attr_timeout;
+	e.entry_timeout = overlayfs_options.entry_timeout;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (overlayfs_dirp->offset==0) {
+		struct inode_struct *inode=overlayfs_dirp->parent->inode;
+
+        	/* the . entry */
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotname;
+
+		inode->nlookup++;
+
+    	    } else if (overlayfs_dirp->offset==1) {
+    		struct inode_struct *inode=NULL;
+
+        	/* the .. entry */
+
+		if (isrootentry(overlayfs_dirp->parent)==1 ) {
+
+		    inode=overlayfs_dirp->parent->inode;
+
+		} else {
+
+		    inode=overlayfs_dirp->parent->parent->inode;
+
+		}
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotdotname;
+
+		inode->nlookup++;
+
+    	    } else {
+    		struct inode_struct *inode=NULL;
+
+		if (! overlayfs_dirp->entry) {
+		    struct entry_struct *entry;
+		    unsigned int row=0;
+		    struct linux_dirent *de=NULL;
+		    unsigned char d_type=0;
+
+		    readdir:
+
+		    if (overlayfs_dirp->pos >= overlayfs_dirp->read) {
+			int read=0;
+
+			read=syscall(SYS_getdents, overlayfs_dirp->fd, overlayfs_dirp->buffer, overlayfs_dirp->size);
+
+			if (read<=0) {
+
+			    if (read==-1) {
+
+				error=errno;
+				free(buff);
+				goto error;
+
+			    }
+
+			    overlayfs_dirp->mode |= _OVERLAYFS_MODE_FINISH;
+			    break;
+
+			}
+
+			overlayfs_dirp->pos=0;
+			overlayfs_dirp->read=read;
+
+		    }
+
+		    de=(struct linux_dirent *) (overlayfs_dirp->buffer + overlayfs_dirp->pos);
+		    overlayfs_dirp->pos+=de->d_reclen;
+
+		    logoutput("overlayfs_readdirplus: found %s", de->d_name);
+
+		    if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) {
+
+			goto readdir;
+
+		    }
+
+		    if (fstatat(overlayfs_dirp->fd, de->d_name, &e.attr, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT)==-1) {
+
+			goto readdir;
+
+		    }
+
+		    d_type=*(overlayfs_dirp->buffer + overlayfs_dirp->pos + de->d_reclen - 1);
+
+		    entry=find_entry_by_name_sl(overlayfs_dirp->parent, de->d_name, &row, &error);
+
+		    if (! entry) {
+
+			entry=insert_entry_sl(overlayfs_dirp->parent, de->d_name, &row, &error, create_entry_cb, NULL);
+
+			if (! entry) break;
+
+			inode=entry->inode;
+
+			memcpy(&entry->synctime, &overlayfs_dirp->synctime, sizeof(struct timespec));
+
+			inode->mode=DTTOIF(d_type);
+
+			inode->nlookup++;
+			adjust_pathmax(overlayfs_dirp->lenpath + strlen(name));
+
+		    } else {
+
+			inode=entry->inode;
+			memcpy(&entry->synctime, &overlayfs_dirp->synctime, sizeof(struct timespec));
+
+			inode->nlookup++;
+
+		    }
+
+		    name=entry->name;
+		    overlayfs_dirp->entry=entry;
+
+		    inode->mode = e.attr.st_mode;
+		    inode->nlink = e.attr.st_nlink;
+		    inode->uid = e.attr.st_uid;
+		    inode->gid = e.attr.st_gid;
+		    inode->rdev = e.attr.st_rdev;
+
+		    inode->mtim.tv_sec = e.attr.st_mtim.tv_sec;
+		    inode->mtim.tv_nsec = e.attr.st_mtim.tv_nsec;
+		    inode->ctim.tv_sec = e.attr.st_ctim.tv_sec;
+		    inode->ctim.tv_nsec = e.attr.st_ctim.tv_nsec;
+
+		    if (S_ISDIR(e.attr.st_mode)) {
+
+			e.attr.st_size=0;
+
+		    } else {
+
+			inode->type.size=e.attr.st_size;
 
 		    }
 
 		} else {
 
-		    nreturn=-ENOMEM;
-		    break;
+		    inode=overlayfs_dirp->entry->inode;
+		    name=overlayfs_dirp->entry->name;
+
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->type.size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    inode->nlookup++;
 
 		}
 
-		add_to_name_hash_table(entry);
-		add_to_inode_hash_table(entry->inode);
+		e.ino = inode->ino;
+		e.attr.st_ino = e.ino;
 
 	    }
 
-	    entry->inode->st.st_atim.tv_sec=sync_time->tv_sec;
-	    entry->inode->st.st_atim.tv_nsec=sync_time->tv_nsec;
+	    logoutput("overlayfs_readdirplus: add direntry %s, offset %i", name, overlayfs_dirp->offset);
 
-	    generic_dirp->st.st_ino=entry->inode->ino;
+    	    dirent_size=fuse_add_direntry_plus(req, buff+pos, size-pos, name, &e, overlayfs_dirp->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    overlayfs_dirp->entry=NULL; /* forget current entry to force readdir */
+	    overlayfs_dirp->offset++;
+	    pos += dirent_size;
 
         }
 
-        entsize=fuse_add_direntry(req, buff+buffpos, size-buffpos, generic_dirp->name, &generic_dirp->st, generic_dirp->upperfs_offset);
-
-	if (buffpos+entsize > size) break;
-
-	/* increase counter and clear the various fields */
-
-        generic_dirp->upperfs_offset++;
-	generic_dirp->name=NULL;
-	generic_dirp->st.st_ino=0;
-	generic_dirp->st.st_mode=0;
-
-	buffpos += entsize;
-
-    }
-
-    out:
-
-    if (nreturn < 0 ) {
-
-	fuse_reply_err(req, -nreturn);
-
-    } else {
-
-	fuse_reply_buf(req, buff, buffpos);
-
-    }
-
-    if ( buff ) {
+	fuse_reply_buf(req, buff, pos);
 
 	free(buff);
 	buff=NULL;
 
+	return;
+
     }
+
+    error:
+
+    fuse_reply_err(req, error);
 
 }
 
 static void overlayfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset, struct fuse_file_info *fi)
 {
-    struct generic_dirp_struct *generic_dirp=(struct generic_dirp_struct *) (uintptr_t) fi->fh;
+    struct overlayfs_dirp_struct *overlayfs_dirp=(struct overlayfs_dirp_struct *) (uintptr_t) fi->fh;
 
-    if (generic_dirp->virtual==1) {
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_VIRTUAL) {
 
-	overlayfs_readdir_virtual(req, size, offset, generic_dirp);
+	overlayfs_readdir_virtual(req, size, offset, overlayfs_dirp);
 
     } else {
 
-	overlayfs_readdir_real(req, size, offset, generic_dirp);
+	overlayfs_readdir_real(req, size, offset, overlayfs_dirp);
+
+    }
+
+}
+
+static void overlayfs_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    struct overlayfs_dirp_struct *overlayfs_dirp=(struct overlayfs_dirp_struct *) (uintptr_t) fi->fh;
+
+    if (overlayfs_dirp->mode & _OVERLAYFS_MODE_VIRTUAL) {
+
+	overlayfs_readdirplus_virtual(req, size, offset, overlayfs_dirp);
+
+    } else {
+
+	overlayfs_readdirplus_real(req, size, offset, overlayfs_dirp);
 
     }
 
@@ -1334,56 +1768,76 @@ static void overlayfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t
 
 static void overlayfs_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    struct generic_dirp_struct *generic_dirp=(struct generic_dirp_struct *) (uintptr_t) fi->fh;
+    struct overlayfs_dirp_struct *overlayfs_dirp=(struct overlayfs_dirp_struct *) (uintptr_t) fi->fh;
 
     (void) ino;
 
     logoutput("RELEASEDIR");
 
-    if (generic_dirp) {
+    if (overlayfs_dirp) {
 
-	if (generic_dirp->virtual==0) {
-	    struct inode_struct *inode=generic_dirp->parent->inode;
+	if (overlayfs_dirp->fd>0) {
 
-	    if (generic_dirp->data) {
-
-	        closedir((DIR *)generic_dirp->data);
-		generic_dirp->data=NULL;
-
-	    }
-
-	    remove_old_entries(generic_dirp->parent, &generic_dirp->parent->inode->st.st_atim);
+	    close(overlayfs_dirp->fd);
+	    overlayfs_dirp->fd=0;
 
 	}
 
-	free(generic_dirp);
-	generic_dirp=NULL;
+	if (overlayfs_dirp->buffer) {
 
+	    free(overlayfs_dirp->buffer);
+	    overlayfs_dirp->buffer=NULL;
+
+	}
+
+	if (!(overlayfs_dirp->mode & _OVERLAYFS_MODE_VIRTUAL)) {
+	    struct directory_struct *directory=NULL;
+	    unsigned int error=0;
+
+	    /* remove the entries not found when syncing with backend */
+
+	    remove_old_entries(overlayfs_dirp->parent, &overlayfs_dirp->synctime);
+
+	    directory=get_directory_sl(overlayfs_dirp->parent, 0, &error);
+
+	    if (directory) {
+
+		logoutput("overlayfs_releasedir: copy time %li:%li", overlayfs_dirp->synctime.tv_sec, overlayfs_dirp->synctime.tv_nsec);
+
+		directory->synctime.tv_sec=overlayfs_dirp->synctime.tv_sec;
+		directory->synctime.tv_nsec=overlayfs_dirp->synctime.tv_nsec;
+
+	    }
+
+	}
+
+	free(overlayfs_dirp);
+	overlayfs_dirp=NULL;
 
     }
 
     fuse_reply_err(req, 0);
-
     fi->fh=0;
+
+    clean_pathcache();
 
 }
 
 static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
 {
     struct statvfs st;
-    int nreturn=0, res;
+    unsigned int error=0;
     struct entry_struct *entry; 
     struct inode_struct *inode;
-    struct call_info_struct call_info=CALL_INFO_INIT;
 
     logoutput("STATFS");
 
-    inode=find_inode_generic(ino);
+    inode=find_inode(ino);
 
     if ( ! inode ) {
 
-	nreturn=-ENOENT;
-	goto out;
+	error=ENOENT;
+	goto error;
 
     }
 
@@ -1391,8 +1845,8 @@ static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
 
     if ( ! entry ){
 
-	nreturn=-ENOENT;
-	goto out;
+	error=ENOENT;
+	goto error;
 
     }
 
@@ -1400,24 +1854,22 @@ static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
 
     /* should the statvfs be taken of the path or the root ?? */
 
-    res=statvfs("/", &st);
-
-    if ( res==0 ) {
+    if (statvfs("/", &st)==0) {
 
 	// take some values from the default
 
 	/* note the fs does not provide opening/reading/writing of files, so info about blocksize etc
 	   is useless, so do not override the default from the root */ 
 
-	// st.f_bsize=4096; /* good?? */
-	// st.f_frsize=st.f_bsize; /* no fragmentation on this fs */
+	st.f_bsize=4096; /* good?? */
+	st.f_frsize=st.f_bsize; /* no fragmentation on this fs */
 	st.f_blocks=0;
 
 	st.f_bfree=0;
 	st.f_bavail=0;
 
-	st.f_files=get_inoctr();
-	st.f_ffree=UINT32_MAX - st.f_files ; /* inodes are of unsigned long int, 4 bytes:32 */
+	st.f_files=get_nrinodes();
+	st.f_ffree=UINT64_MAX - st.f_files ; /* inodes are of unsigned long int, 4 bytes:32 */
 	st.f_favail=st.f_ffree;
 
 	// do not know what to put here... just some default values... no fsid.... just zero
@@ -1426,25 +1878,94 @@ static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
 	st.f_flag=0;
 	st.f_namemax=255;
 
+	fuse_reply_statfs(req, &st);
+
+	return;
+
     } else {
 
-	nreturn=-errno;
+	error=errno;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+    logoutput("statfs error: %i", error);
+
+}
+
+static void overlayfs_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
+{
+    unsigned int error=0;
+    struct entry_struct *entry;
+    struct inode_struct *inode;
+    struct call_info_struct call_info=CALL_INFO_INIT;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct notifywatch_struct *watch=NULL;
+
+    logoutput("FSNOTIFY");
+
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    inode=find_inode(ino);
+
+    if ( ! inode ) {
+
+	error=ENOENT;
+	goto out;
+
+    }
+
+    entry=inode->alias;
+
+    if ( ! entry ){
+
+	error=ENOENT;
+	goto out;
+
+    }
+
+    call_info.entry=entry;
+
+    if (isrootentry(entry)==1) {
+
+	call_info.pathinfo.path = (char *)rootpath;
+	call_info.pathinfo.flags = PATHINFOFLAGS_INUSE;
+	call_info.pathinfo.len = strlen(rootpath);
+
+    } else {
+
+	if (get_path(&call_info, &error)==-1) goto out;
+
+    }
+
+    logoutput("overlayfs_fsnotify: on %s mask %i", call_info.pathinfo.path, mask);
+
+    watch=lookup_watch_inode(inode);
+
+    if (watch) {
+
+	watch->mask=mask;
+	change_notifywatch(watch);
+
+    } else if (mask>0) {
+
+	watch=add_notifywatch(inode, mask, &call_info.pathinfo);
 
     }
 
     out:
 
-    if (nreturn==0) {
-
-	fuse_reply_statfs(req, &st);
-
-    } else {
-
-        fuse_reply_err(req, nreturn);
-
-    }
-
-    logoutput("statfs,nreturn: %i", nreturn);
+    free_path_pathinfo(&call_info.pathinfo);
 
 }
 
@@ -1460,6 +1981,180 @@ static void overlayfs_destroy (void *userdata)
 
     logoutput("DESTROY");
 
+
+}
+
+static void overlayfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
+{
+    struct inode_struct *inode;
+
+    logoutput("GETXATTR, name %s", name);
+
+    if (strcmp(name, "system.posix_acl_access")==0 || strcmp(name, "system.posix_acl_default")==0) goto out;
+
+    inode=find_inode(ino);
+
+    if ( inode ) {
+	struct entry_struct *entry=NULL;
+
+	entry=inode->alias;
+
+	if ( entry ) {
+
+	    if (isrootentry(entry)==1) {
+
+		if (strcmp(name, "pathmax")==0) {
+
+		    if (size==0) {
+			size_t count=0;
+
+			/* pathmax */
+
+			count+=log10(get_pathmax()) + 2;
+
+			fuse_reply_xattr(req, count);
+
+		    } else {
+			size_t count=0;
+
+			/* pathmax */
+
+			count+=log10(get_pathmax()) + 2;
+
+			if (count<size) {
+			    char *buff=NULL;
+			    char result[count];
+
+			    buff=malloc(size);
+
+			    if (buff) {
+
+				sprintf(result, "%i", (int) get_pathmax());
+
+				memset(buff, 0, size);
+				memcpy(buff, result, count);
+
+				logoutput("overlayfs_getxattr: reply buff %s", buff);
+
+				fuse_reply_buf(req, buff, size);
+
+				free(buff);
+
+			    } else {
+
+				fuse_reply_err(req, ENOMEM);
+
+			    }
+
+			} else {
+
+			    fuse_reply_err(req, ERANGE);
+
+			}
+
+		    }
+
+		    return;
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    out:
+
+    fuse_reply_err(req, ENOATTR);
+
+}
+
+static void overlayfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+    struct inode_struct *inode;
+
+    logoutput("LISTXATTR");
+
+    inode=find_inode(ino);
+
+    if ( inode ) {
+	struct entry_struct *entry=NULL;
+
+	entry=inode->alias;
+
+	if ( entry ) {
+
+	    if (isrootentry(entry)==1) {
+
+		if (size==0) {
+		    size_t count=0;
+
+		    /* pathmax */
+
+		    count+=strlen("pathmax") + 2;
+
+		    fuse_reply_xattr(req, count);
+
+		} else {
+		    size_t count=0;
+
+		    /* pathmax */
+
+		    count+=strlen("pathmax") + 2;
+
+		    if (count<=size) {
+			char *buff=NULL;
+			char result[count];
+
+			buff=malloc(size);
+
+			if (buff) {
+			    int len=0;
+
+			    len=sprintf(result, "%i", (int) get_pathmax());
+
+			    memset(buff, '\0', size);
+			    memcpy(buff, result, count);
+
+			    logoutput("overlayfs_listxattr: reply buff %s", buff);
+
+			    fuse_reply_buf(req, buff, size);
+
+			    free(buff);
+
+			} else {
+
+			    fuse_reply_err(req, ENOMEM);
+
+			}
+
+		    } else {
+
+			fuse_reply_err(req, ERANGE);
+
+		    }
+
+		}
+
+		return;
+
+	    }
+
+	}
+
+    }
+
+    if (size==0) {
+
+	fuse_reply_xattr(req, 0);
+
+    } else {
+
+	fuse_reply_buf(req, NULL, 0);
+
+    }
+
 }
 
 struct fuse_lowlevel_ops overlayfs_oper = {
@@ -1473,100 +2168,53 @@ struct fuse_lowlevel_ops overlayfs_oper = {
     .readlink	= overlayfs_readlink,
     .opendir	= overlayfs_opendir,
     .readdir	= overlayfs_readdir,
+    .readdirplus= overlayfs_readdirplus,
     .releasedir	= overlayfs_releasedir,
     .statfs	= overlayfs_statfs,
+    .fsnotify   = overlayfs_fsnotify,
+    .listxattr  = overlayfs_listxattr,
+    .getxattr	= overlayfs_getxattr,
 };
-
-int process_server_event(struct notifyfs_connection_struct *connection, uint32_t events)
-{
-
-    if (events & EPOLLIN) {
-
-	int res=receive_message(connection->fd, connection->data, events, NOTIFYFS_OWNERTYPE_SERVER, recv_buffer, NOTIFYFS_RECVBUFFERSIZE);
-
-    }
-
-    if (events & (EPOLLHUP|EPOLLRDHUP) ) {
-
-	logoutput("process_server_event: hangup of remote site");
-
-    }
-
-    return 0;
-
-}
-
-/* send a client message, from client to server, like:
-   - register a client as app or as fs or both
-   - signoff as client at server
-   - give messagemask, to inform the server about what messages to receive, like mountinfo
-   */
-
-void send_register_to_server(int fd, char *path)
-{
-    uint64_t unique=new_uniquectr();
-
-    if (send_register_message(fd, unique, getpid(), NOTIFYFS_CLIENTTYPE_FUSEFS,(void *) path, strlen(path)+1)>0) {
-	int res;
-
-	init_notifyfs_reply(unique);
-	res=wait_for_notifyfs_reply(unique, 5);
-
-	if (res==-ETIMEDOUT) {
-
-	    logoutput("send_register_to_server: waiting for reply timed out");
-
-	} else if (res<0) {
-
-	    logoutput("send_register_to_server: error %i waiting a reply", res);
-
-	} else {
-
-	    logoutput("send_register_to_server: received a reply");
-
-	}
-
-    }
-
-}
 
 int main(int argc, char *argv[])
 {
     int res, epoll_fd=0;
     struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
-    struct workerthreads_queue_struct workerthreads_queue=WORKERTHREADS_QUEUE_INIT;
+    struct workerthreads_queue_struct workerthreads_queue;
+    unsigned int error=0;
 
     umask(0);
 
-    // set logging
-
-    openlog("fuse.overlayfs", 0,0); 
+    open_logoutput(); 
 
     /* parse commandline options and initialize the fuse options */
 
-    res=parse_arguments(argc, argv, &global_fuse_args);
+    if (parse_arguments(argc, argv, &global_fuse_args, &error)==-1) {
 
-    if ( res<0 ) {
-
-	res=0;
+	fprintf(stderr, "Error, cannot parse arguments (error: %i).\n", error);
 	goto skipeverything;
 
     }
 
-    set_max_nr_workerthreads(&workerthreads_queue, 6);
-    add_workerthreads(&workerthreads_queue, 6);
+    initialize_workerthreads(&workerthreads_queue);
 
-    init_changestate(&workerthreads_queue);
+    set_max_numberthreads(&workerthreads_queue, 6);
+    set_workerthreads_timeout(&workerthreads_queue, 10);
 
     /*
         init the hash lookup tables
     */
 
-    res=init_hashtables();
+    if (init_pathcache_group(&error)==-1) {
 
-    if ( res<0 ) {
+	fprintf(stderr, "Error, cannot intialize pathcache (error: %i).\n", error);
+	exit(1);
 
-	fprintf(stderr, "Error, cannot intialize hash tables (error: %i).\n", abs(res));
+    }
+
+    if (init_inode_hashtable(&error)==-1) {
+
+	fprintf(stderr, "Error, cannot intialize hash tables (error: %i).\n", error);
 	exit(1);
 
     }
@@ -1575,25 +2223,13 @@ int main(int argc, char *argv[])
         create the root inode and entry
     */
 
-    res=create_root();
+    if (create_root(&error)==-1) {
 
-    if ( res<0 ) {
-
-	fprintf(stderr, "Error, failed to create the root entry(error: %i).\n", res);
+	fprintf(stderr, "Error, failed to create the root entry(error: %i).\n", error);
 	exit(1);
 
     }
 
-    /*
-        set default options
-    */
-
-    loglevel=overlayfs_options.logging;
-    logarea=overlayfs_options.logarea;
-
-    overlayfs_options.attr_timeout=1.0;
-    overlayfs_options.entry_timeout=1.0;
-    overlayfs_options.negative_timeout=1.0;
 
     res = fuse_daemonize(0);
 
@@ -1604,89 +2240,76 @@ int main(int argc, char *argv[])
 
     }
 
-    /* initialize the eventloop (using epoll) */
+    /*
+	initialize the eventloop (using epoll)
+    */
 
-    epoll_fd=init_eventloop(NULL, 1, 0);
+    if (init_beventloop(NULL, &error)==-1) {
 
-    if ( epoll_fd<0 ) {
-
-        logoutput("Error creating epoll fd, error: %i.", epoll_fd);
+        logoutput("Error creating eventloop, error: %i.", error);
         goto out;
 
-    } else {
+    }
 
-	logoutput("Init mainloop, epoll fd: %i", epoll_fd);
+    /*
+	add signal handler to eventloop
+    */
+
+    if (set_beventloop_signal(NULL, 1, &error)==-1) {
+
+	logoutput("Error adding signal handler to eventlopp: %i.", error);
+        goto out;
 
     }
 
     /*
-	fs notify backends
+	initialize fs change notify
     */
 
-    initialize_fsnotify_backends();
+    if (init_fschangenotify(&error)==-1) {
 
-
-    /*
-        connect to the notifyfs server
-    */
-
-    notifyfsserver.fd=0;
-    init_xdata(&notifyfsserver.xdata_socket);
-    notifyfsserver.data=NULL;
-    notifyfsserver.type=0;
-    notifyfsserver.allocated=0;
-    notifyfsserver.process_event=NULL;
-
-    if (strlen(overlayfs_options.notifyfs_socket)>0) {
-
-	init_handleclientmessage(&workerthreads_queue);
-
-	int socket_fd=create_local_clientsocket(overlayfs_options.notifyfs_socket, &notifyfsserver, NULL, process_server_event);
-
-	if ( socket_fd<=0 ) {
-
-    	    logoutput("Error creating socket fd: %i when connecting to %s", socket_fd, overlayfs_options.notifyfs_socket);
-	    res=socket_fd;
-    	    goto out;
-
-	}
-
-	recv_buffer=malloc(NOTIFYFS_RECVBUFFERSIZE);
-
-	if (! recv_buffer) {
-
-	    logoutput("Error creating the buffer to receive messages from notifyfs server.");
-	    res=-ENOMEM;
-	    goto out;
-
-	}
-
-	send_register_to_server(socket_fd, overlayfs_options.mountpoint);
+	logoutput("Error initializing fschange notify, error: %i", error);
+	goto out;
 
     }
 
-    /* add the fuse channel(=fd) to the mainloop */
+    /*
+	add the fuse channel(=fd) to the eventloop
+    */
 
     res=initialize_fuse(overlayfs_options.mountpoint, "overlayfs", &overlayfs_oper, sizeof(overlayfs_oper), &global_fuse_args, &workerthreads_queue);
     if (res<0) goto out;
 
-    res=start_epoll_eventloop(NULL);
+    res=start_beventloop(NULL);
 
     out:
 
+    destroy_workerthreads_queue(&workerthreads_queue);
+
     finish_fuse();
+
+    end_fschangenotify();
 
     /* remove any remaining xdata from mainloop */
 
-    destroy_eventloop(NULL);
-    fuse_opt_free_args(&global_fuse_args);
+    destroy_beventloop(NULL);
 
-    destroy_workerthreads_queue(&workerthreads_queue);
+    fuse_opt_free_args(&global_fuse_args);
 
     skipeverything:
 
-    closelog();
+    close_logoutput();
 
-    return res ? 1 : 0;
+    return error>0 ? 1 : 0;
+
+    notforked:
+
+    if (error>0) {
+
+	fprintf(stderr, "Error (error: %i).\n", error);
+
+    }
+
+    return error>0 ? 1 : 0;
 
 }

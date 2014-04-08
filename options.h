@@ -19,11 +19,17 @@
 #ifndef SIMPLEOVERLAYFS_OPTIONS_H
 #define SIMPLEOVERLAYFS_OPTIONS_H
 
+#define SIMPLEOVERLAYFS_CONFIGFILE "/etc/simpleoverlayfs/options"
+
 struct overlayfs_options_struct {
-    char notifyfs_socket[PATH_MAX];
-    pathstring mountpoint;
-    unsigned char logging;
-    int logarea;
+    char *mountpoint;
+    unsigned char fuse_logging;
+    unsigned char main_logging;
+    unsigned char fschangenotify_logging;
+    unsigned char entry_logging;
+    unsigned char path_logging;
+    unsigned char skiplist_logging;
+    char *configfile;
     double attr_timeout;
     double entry_timeout;
     double negative_timeout;
@@ -32,7 +38,7 @@ struct overlayfs_options_struct {
 
 // Prototypes
 
-int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args);
+int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsigned int *error);
 
 #endif
 

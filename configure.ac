@@ -37,13 +37,14 @@ AC_FUNC_FORK
 AC_FUNC_LSTAT_FOLLOWS_SLASHED_SYMLINK
 AC_FUNC_MALLOC
 AC_FUNC_REALLOC
+
 AC_CHECK_FUNCS([clock_gettime fdatasync ftruncate memmove memset mkdir realpath rmdir strchr strdup strerror strrchr strstr])
+AC_CHECK_FUNCS([inotify_init], [AC_DEFINE([HAVE_INOTIFY], [1], [Check for inotify])])
 
-AC_CHECK_FUNCS([inotify_init], [AC_DEFINE([HAVE_INOTIFY], [1], [Check for libinotify])])
+# AC_CHECK_FUNCS([inotify_init], [AC_DEFINE([HAVE_INOTIFY], [1], [Check for libinotify])])
 
-PKG_CHECK_MODULES(FUSE, [ fuse >= 2.5 ])
+PKG_CHECK_MODULES(FUSE, [ fuse3 >= 3.0 ])
 PKG_CHECK_MODULES(GLIB, [ glib-2.0 ])
-
 
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
