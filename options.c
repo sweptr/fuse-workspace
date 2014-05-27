@@ -38,10 +38,9 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#include <fuse3/fuse_lowlevel.h>
-
-
-#include "simpleoverlayfs.h"
+#include "fuse-workspace.h"
+#include "skiplist.h"
+#include "entry-management.h"
 #include "path-resolution.h"
 #include "options.h"
 #include "utils.h"
@@ -78,7 +77,7 @@ static inline void dummy_nolog()
 
 #endif
 
-extern struct overlayfs_options_struct overlayfs_options;
+extern struct fs_options_struct fs_options;
 
 static void print_usage(const char *progname)
 {
@@ -86,8 +85,7 @@ static void print_usage(const char *progname)
 			"%s [opts]\n"
 			"\n"
 	                "          --configfile=PATH\n"
-	                "          --fuseoptions=COMMASEP STRING\n"
-	                "          --mountpoint=PATH\n", progname);
+	                "          --fuseoptions=COMMASEP STRING\n", progname);
 
 }
 
@@ -143,7 +141,7 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.attr_timeout=strtod(value, NULL);
+			fs_options.attr_timeout=strtod(value, NULL);
 
 		    }
 
@@ -151,7 +149,7 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.entry_timeout=strtod(value, NULL);
+			fs_options.entry_timeout=strtod(value, NULL);
 
 		    }
 
@@ -159,7 +157,7 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.negative_timeout=strtod(value, NULL);
+			fs_options.negative_timeout=strtod(value, NULL);
 
 		    }
 
@@ -167,15 +165,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.fuse_logging=atoi(value);
+			fs_options.fuse_logging=atoi(value);
 
-			if (overlayfs_options.fuse_logging>5) {
+			if (fs_options.fuse_logging>5) {
 
-			    overlayfs_options.fuse_logging=5;
+			    fs_options.fuse_logging=5;
 
-			} else if (overlayfs_options.fuse_logging<0) {
+			} else if (fs_options.fuse_logging<0) {
 
-			    overlayfs_options.fuse_logging=0;
+			    fs_options.fuse_logging=0;
 
 			}
 
@@ -185,15 +183,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.main_logging=atoi(value);
+			fs_options.main_logging=atoi(value);
 
-			if (overlayfs_options.main_logging>5) {
+			if (fs_options.main_logging>5) {
 
-			    overlayfs_options.main_logging=5;
+			    fs_options.main_logging=5;
 
-			} else if (overlayfs_options.main_logging<0) {
+			} else if (fs_options.main_logging<0) {
 
-			    overlayfs_options.main_logging=0;
+			    fs_options.main_logging=0;
 
 			}
 
@@ -203,15 +201,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.fschangenotify_logging=atoi(value);
+			fs_options.fschangenotify_logging=atoi(value);
 
-			if (overlayfs_options.fschangenotify_logging>5) {
+			if (fs_options.fschangenotify_logging>5) {
 
-			    overlayfs_options.fschangenotify_logging=5;
+			    fs_options.fschangenotify_logging=5;
 
-			} else if (overlayfs_options.fschangenotify_logging<0) {
+			} else if (fs_options.fschangenotify_logging<0) {
 
-			    overlayfs_options.fschangenotify_logging=0;
+			    fs_options.fschangenotify_logging=0;
 
 			}
 
@@ -221,15 +219,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.entry_logging=atoi(value);
+			fs_options.entry_logging=atoi(value);
 
-			if (overlayfs_options.entry_logging>5) {
+			if (fs_options.entry_logging>5) {
 
-			    overlayfs_options.entry_logging=5;
+			    fs_options.entry_logging=5;
 
-			} else if (overlayfs_options.entry_logging<0) {
+			} else if (fs_options.entry_logging<0) {
 
-			    overlayfs_options.entry_logging=0;
+			    fs_options.entry_logging=0;
 
 			}
 
@@ -239,15 +237,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.path_logging=atoi(value);
+			fs_options.path_logging=atoi(value);
 
-			if (overlayfs_options.path_logging>5) {
+			if (fs_options.path_logging>5) {
 
-			    overlayfs_options.path_logging=5;
+			    fs_options.path_logging=5;
 
-			} else if (overlayfs_options.path_logging<0) {
+			} else if (fs_options.path_logging<0) {
 
-			    overlayfs_options.path_logging=0;
+			    fs_options.path_logging=0;
 
 			}
 
@@ -257,15 +255,15 @@ static void read_config(char *path, char **fuseoptions)
 
 		    if (strlen(value)>0) {
 
-			overlayfs_options.skiplist_logging=atoi(value);
+			fs_options.skiplist_logging=atoi(value);
 
-			if (overlayfs_options.skiplist_logging>5) {
+			if (fs_options.skiplist_logging>5) {
 
-			    overlayfs_options.skiplist_logging=5;
+			    fs_options.skiplist_logging=5;
 
-			} else if (overlayfs_options.skiplist_logging<0) {
+			} else if (fs_options.skiplist_logging<0) {
 
-			    overlayfs_options.skiplist_logging=0;
+			    fs_options.skiplist_logging=0;
 
 			}
 
@@ -326,8 +324,8 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
     static struct option long_options[] = {
 	{"help", 		optional_argument, 		0, 0},
 	{"version", 		optional_argument, 		0, 0},
-	{"mountpoint", 		optional_argument,		0, 0},
 	{"configfile", 		optional_argument,		0, 0},
+	{"basemap", 		optional_argument,		0, 0},
 	{0,0,0,0}
 	};
     int res, long_options_index=0, result=0;
@@ -336,17 +334,14 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
     /* set defaults */
 
-    /* mountpoint */
-
-    overlayfs_options.mountpoint=NULL;
-
     /* configfile */
 
-    overlayfs_options.configfile=NULL;
+    fs_options.configfile=NULL;
+    fs_options.basemap=NULL;
 
-    overlayfs_options.attr_timeout=1.0;
-    overlayfs_options.entry_timeout=1.0;
-    overlayfs_options.negative_timeout=1.0;
+    fs_options.attr_timeout=1.0;
+    fs_options.entry_timeout=1.0;
+    fs_options.negative_timeout=1.0;
 
     /* start the fuse options with the program name, just like the normal argv */
 
@@ -356,7 +351,6 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 	*error=EINVAL;
 
     }
-
 
     while(1) {
 
@@ -395,9 +389,9 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
 		    if ( optarg ) {
 
-			overlayfs_options.configfile=realpath(optarg, NULL);
+			fs_options.configfile=realpath(optarg, NULL);
 
-			if ( ! overlayfs_options.configfile) {
+			if ( ! fs_options.configfile) {
 
 			    result=-1;
 			    *error=ENOMEM;
@@ -409,6 +403,30 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 		    } else {
 
 			fprintf(stderr, "Error: option --configfile requires an argument. Cannot continue.\n");
+			result=-1;
+			*error=EINVAL;
+			goto out;
+
+		    }
+
+		} else if ( strcmp(long_options[long_options_index].name, "basemap")==0 ) {
+
+		    if ( optarg ) {
+
+			fs_options.basemap=realpath(optarg, NULL);
+
+			if ( ! fs_options.basemap) {
+
+			    result=-1;
+			    *error=ENOMEM;
+			    fprintf(stderr, "Error:(%i) option --basemap=%s cannot be parsed. Cannot continue.\n", errno, optarg);
+			    goto out;
+
+			}
+
+		    } else {
+
+			fprintf(stderr, "Error: option --basemap requires an argument. Cannot continue.\n");
 			result=-1;
 			*error=EINVAL;
 			goto out;
@@ -436,30 +454,6 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
 		    }
 
-		} else if ( strcmp(long_options[long_options_index].name, "mountpoint")==0 ) {
-
-		    if ( optarg ) {
-
-			overlayfs_options.mountpoint=realpath(optarg, NULL);
-
-			if ( ! overlayfs_options.mountpoint) {
-
-			    result=-1;
-			    *error=ENOMEM;
-			    fprintf(stderr, "Error:(%i) option --mountpoint=%s cannot be parsed. Cannot continue.\n", errno, optarg);
-			    goto out;
-
-			}
-
-		    } else {
-
-			fprintf(stderr, "Error: option --mountpoint requires an argument. Cannot continue.\n");
-			result=-1;
-			*error=EINVAL;
-			goto out;
-
-		    }
-
 		}
 
 	    case '?':
@@ -476,21 +470,13 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
     out:
 
-    if (! overlayfs_options.mountpoint) {
+    if (fs_options.configfile) {
 
-	fprintf(stderr, "Error: option --mountpoint not defined. Cannot continue.\n");
-	result=-1;
-	*error=EINVAL;
-
-    }
-
-    if (overlayfs_options.configfile) {
-
-	read_config(overlayfs_options.configfile, &fuseoptions);
+	read_config(fs_options.configfile, &fuseoptions);
 
     } else {
 
-	read_config(SIMPLEOVERLAYFS_CONFIGFILE, &fuseoptions);
+	read_config(FUSE_WORKSPACE_CONFIGFILE, &fuseoptions);
 
     }
 
@@ -547,7 +533,7 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
     finish:
 
-    return (*error==0) ? 0 : -1;
+    return result;
 
 }
 

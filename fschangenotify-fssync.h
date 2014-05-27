@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013, 2014 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -16,32 +16,12 @@
   Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
-#ifndef FUSE_WORKSPACE_OPTIONS_H
-#define FUSE_WORKSPACE_OPTIONS_H
 
-#define FUSE_WORKSPACE_CONFIGFILE "/etc/fuse-workspace/options"
-#define FUSE_WORKSPACE_BASEMAP "/etc/fuse-workspace/base"
-
-struct fs_options_struct {
-    unsigned char fuse_logging;
-    unsigned char main_logging;
-    unsigned char fschangenotify_logging;
-    unsigned char entry_logging;
-    unsigned char path_logging;
-    unsigned char skiplist_logging;
-    char *configfile;
-    char *basemap;
-    double attr_timeout;
-    double entry_timeout;
-    double negative_timeout;
-};
-
+#ifndef _FSCHANGENOTIFY_FSSYNC_H
+#define _FSCHANGENOTIFY_FSSYNC_H
 
 // Prototypes
 
-int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsigned int *error);
+int init_fssync(unsigned int *error);
 
 #endif
-
-
-

@@ -4,7 +4,7 @@
 AC_PREREQ([2.68])
 AC_INIT([notifyfs], [1.0], [none])
 AM_INIT_AUTOMAKE
-AC_CONFIG_SRCDIR([simpleoverlayfs.h])
+AC_CONFIG_SRCDIR([fuse-workspace.h])
 AC_CONFIG_HEADERS([config.h])
 
 

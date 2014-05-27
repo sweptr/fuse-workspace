@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013, 2014 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -17,16 +17,42 @@
 
 */
 
-#ifndef _WATCHES_H
-#define _WATCHES_H
+#ifndef _FSCHANGENOTIFY_H
+#define _FSCHANGENOTIFY_H
+
+#define NOTIFYWATCH_BACKEND_OS				1
+#define NOTIFYWATCH_BACKEND_FSSYNC			2
+
+#define NOTIFYWATCH_FLAG_SYSTEM				1
+#define NOTIFYWATCH_FLAG_NOTIFY				2
 
 struct notifywatch_struct {
-    unsigned long ctr;
+    unsigned char flags;
     struct inode_struct *inode;
+    struct workspace_object_struct *object;
     struct pathinfo_struct pathinfo;
+    uint32_t notifymask;
     uint32_t mask;
     pthread_mutex_t mutex;
-    void *backend;
+    struct watchbackend_struct *backend;
+    struct watchcb_struct *cb;
+    void *data;
+    struct notifywatch_struct *next;
+    struct notifywatch_struct *prev;
+};
+
+struct watchbackend_struct {
+    unsigned char type;
+    int (* set_watch) (struct notifywatch_struct *watch);
+    int (* change_watch) (struct notifywatch_struct *watch);
+    void (* remove_watch) (struct notifywatch_struct *watch);
+};
+
+struct watchcb_struct {
+    void (* create) (struct notifywatch_struct *watch, char *name);
+    void (* remove) (struct notifywatch_struct *watch, char *name);
+    void (* change) (struct notifywatch_struct *watch, char *name);
+    void (* destroy) (struct notifywatch_struct *watch);
 };
 
 // Prototypes
@@ -38,12 +64,13 @@ struct notifywatch_struct *lookup_watch_inode(struct inode_struct *inode);
 void add_watch_inodetable(struct notifywatch_struct *watch);
 void remove_watch_inodetable(struct notifywatch_struct *watch);
 
-struct notifywatch_struct *lookup_watch_ctr(unsigned int ctr);
-void add_watch_ctrtable(struct notifywatch_struct *watch);
-void remove_watch_ctrtable(struct notifywatch_struct *watch);
+uint32_t determine_fsnotify_mask(struct inode_struct *inode, struct stat *st);
 
-struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t mask, struct pathinfo_struct *pathinfo);
-void change_notifywatch(struct notifywatch_struct *watch);
+struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t mask, struct pathinfo_struct *pathinfo, struct workspace_object_struct *object, unsigned int *error);
+void change_notifywatch(struct notifywatch_struct *watch, uint32_t mask);
+
+struct notifywatch_struct *add_systemwatch(struct pathinfo_struct *pathinfo, struct watchcb_struct *cb, unsigned int *error);
+void remove_systemwatch(struct notifywatch_struct *watch);
 
 int init_fschangenotify(unsigned int *error);
 void end_fschangenotify();

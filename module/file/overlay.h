@@ -1,5 +1,5 @@
 /*
-  2010, 2011 Stef Bon <stefbon@gmail.com>
+  2010, 2011, 2012, 2013, 2014 Stef Bon <stefbon@gmail.com>
 
   This program is free software; you can redistribute it and/or
   modify it under the terms of the GNU General Public License
@@ -17,8 +17,10 @@
 
 */
 
-#ifndef SIMPLEOVERLAYFS_MAIN_H
-#define SIMPLEOVERLAYFS_MAIN_H
+#ifndef FUSE_BROWSE_OVERLAY_H
+#define FUSE_BROWSE_OVERLAY_H
 
+
+void set_module_calls_overlay(struct module_calls_struct *mcalls);
 
 #endif

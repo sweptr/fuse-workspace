@@ -35,17 +35,27 @@
 #include <sys/param.h>
 
 #include <pthread.h>
+#include <dirent.h>
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA        /* No such attribute */
 #endif
 
-#include "simpleoverlayfs.h"
+#include "fuse-workspace.h"
+
+#include "beventloop-utils.h"
+#include "skiplist.h"
 #include "entry-management.h"
 #include "path-resolution.h"
+
 #include "utils.h"
 #include "options.h"
 #include "simple-list.h"
+#include "workspaces.h"
+#include "objects.h"
+
+
+
 
 #ifdef LOGGING
 
@@ -79,14 +89,16 @@ static inline void dummy_nolog()
 
 #endif
 
-extern struct overlayfs_options_struct overlayfs_options;
+extern struct fs_options_struct fs_options;
 
 struct pathcache_struct {
-    struct entry_struct 	*entry;
-    char 			*path;
-    unsigned int		len;
-    struct timespec		eval_moment;
-    struct pathcache_struct 	*next;
+    struct entry_struct			*entry;
+    struct workspace_object_struct 	*object;
+    unsigned int			relpath;
+    char 				*path;
+    unsigned int			len;
+    struct timespec			eval_moment;
+    struct pathcache_struct 		*next;
 };
 
 static struct pathcache_struct *pathcache_list=NULL;
@@ -99,7 +111,6 @@ const char *dotname=".";
 
 static unsigned int pathmax=2;
 static pthread_mutex_t pathmax_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 
 static unsigned int calculate_pathcache_hash(struct entry_struct *entry)
 {
@@ -136,7 +147,7 @@ int init_pathcache_group(unsigned int *error)
 
 /* lookup pathcache in hash table */
 
-static char *lookup_pathcache(struct call_info_struct *call_info)
+static char *lookup_pathcache(struct entry_struct *entry, struct call_info_struct *call_info)
 {
     struct pathcache_struct *pathcache=NULL;
     void *index=NULL;
@@ -144,18 +155,56 @@ static char *lookup_pathcache(struct call_info_struct *call_info)
 
     lock_list_group(&pathcache_group);
 
-    /* first check a path is present for parent */
+    /* check a path is present for entry */
 
-    hashvalue=calculate_pathcache_hash(call_info->entry->parent);
+    hashvalue=calculate_pathcache_hash(entry);
+    index=NULL;
 
     pathcache=get_next_element(&pathcache_group, &index, hashvalue);
 
     while(pathcache) {
 
-	if (call_info->entry->parent==pathcache->entry) {
-	    unsigned int len = strlen(call_info->entry->name);
+	if (entry==pathcache->entry) {
 
-	    call_info->pathinfo.path=malloc(pathcache->len + 2 + len);
+	    call_info->pathinfo.path=malloc(pathcache->len+1);
+
+	    if (call_info->pathinfo.path) {
+		char *pos=call_info->pathinfo.path;
+
+		memcpy(pos, pathcache->path, pathcache->len);
+		pos+=pathcache->len;
+		*pos = '\0';
+		call_info->pathinfo.len=pathcache->len;
+		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->object=pathcache->object;
+		call_info->relpath=pathcache->relpath;
+
+		logoutput("lookup_pathcache: (2) found path %s", call_info->pathinfo.path);
+
+	    }
+
+	    get_current_time(&pathcache->eval_moment);
+
+	    break;
+
+	}
+
+	pathcache=get_next_element(&pathcache_group, &index, hashvalue);
+
+    }
+
+    /* check a path is present for parent */
+
+    hashvalue=calculate_pathcache_hash(entry->parent);
+
+    pathcache=get_next_element(&pathcache_group, &index, hashvalue);
+
+    while(pathcache) {
+
+	if (entry->parent==pathcache->entry) {
+	    struct name_struct *name=&entry->name;
+
+	    call_info->pathinfo.path=malloc(pathcache->len + 2 + name->len);
 
 	    if (call_info->pathinfo.path) {
 		char *pos=call_info->pathinfo.path;
@@ -164,12 +213,16 @@ static char *lookup_pathcache(struct call_info_struct *call_info)
 		pos+=pathcache->len;
 		*pos = '/';
 		pos++;
-		memcpy(pos, call_info->entry->name, len);
-		pos+=len;
+		memcpy(pos, name->name, name->len);
+		pos+=name->len;
 		*pos = '\0';
 
-		call_info->pathinfo.len=pathcache->len;
+		call_info->pathinfo.len=pathcache->len + 2 + name->len;
 		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->object=pathcache->object;
+		call_info->relpath=pathcache->relpath;
+
+		logoutput("lookup_pathcache: (1) found path %s", call_info->pathinfo.path);
 
 	    }
 
@@ -183,33 +236,57 @@ static char *lookup_pathcache(struct call_info_struct *call_info)
 
     }
 
-    /* second check a path is present for entry */
+    unlock:
 
-    hashvalue=calculate_pathcache_hash(call_info->entry);
-    index=NULL;
+    unlock_list_group(&pathcache_group);
+
+    return call_info->pathinfo.path;
+
+}
+
+static char *lookup_pathcache_extra(struct entry_struct *entry, struct call_info_struct *call_info, struct name_struct *xname)
+{
+    struct pathcache_struct *pathcache=NULL;
+    void *index=NULL;
+    unsigned int hashvalue=0;
+
+    lock_list_group(&pathcache_group);
+
+    /* check a path is present for parent */
+
+    hashvalue=calculate_pathcache_hash(entry);
 
     pathcache=get_next_element(&pathcache_group, &index, hashvalue);
 
     while(pathcache) {
 
-	if (call_info->entry==pathcache->entry) {
+	if (entry==pathcache->entry) {
 
-	    call_info->pathinfo.path=malloc(pathcache->len+1);
+	    call_info->pathinfo.path=malloc(pathcache->len + 2 + xname->len);
 
 	    if (call_info->pathinfo.path) {
 		char *pos=call_info->pathinfo.path;
 
 		memcpy(pos, pathcache->path, pathcache->len);
 		pos+=pathcache->len;
+		*pos = '/';
+		pos++;
+		memcpy(pos, xname->name, xname->len);
+		pos+=xname->len;
 		*pos = '\0';
-		call_info->pathinfo.len=pathcache->len;
+
+		call_info->pathinfo.len=pathcache->len + 2 + xname->len;
 		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->object=pathcache->object;
+		call_info->relpath=pathcache->relpath;
+
+		logoutput("lookup_pathcache_extra: found path %s", call_info->pathinfo.path);
 
 	    }
 
 	    get_current_time(&pathcache->eval_moment);
 
-	    break;
+	    goto unlock;
 
 	}
 
@@ -244,9 +321,9 @@ void clean_pathcache()
 
 	while(pathcache) {
 
-	    if (is_later(&current_time, &pathcache->eval_moment, 1, 0)==1) {
-		struct pathcache_struct *next_pathcache=get_next_element(&pathcache_group, &index, hashvalue);
+	    if (is_later(&current_time, &pathcache->eval_moment, 10, 0)==1) {
 		struct simple_list_struct *element=(struct simple_list_struct *) index;
+		struct pathcache_struct *next_pathcache=get_next_element(&pathcache_group, &index, hashvalue);
 
 		move_from_used(&pathcache_group, element);
 
@@ -279,75 +356,100 @@ void clean_pathcache()
 
 }
 
-int get_path(struct call_info_struct *call_info, unsigned int *error)
+static void remove_pathcache_cb(void *data)
+{
+    struct pathcache_struct *pathcache=(struct pathcache_struct *) data;
+
+    if (pathcache) {
+
+	if (pathcache->path) {
+
+	    free(pathcache->path);
+	    pathcache->path=NULL;
+
+	}
+
+	free(pathcache);
+
+    }
+
+}
+
+void destroy_pathcache()
+{
+
+    free_group(&pathcache_group, remove_pathcache_cb);
+
+}
+
+int get_path(struct call_info_struct *call_info, struct entry_struct *entry, unsigned int *error)
 {
     int result=0;
+    struct inode_struct *inode=entry->inode;
 
-    if ( isrootentry(call_info->entry->parent) ) {
-	char *name=call_info->entry->name;
-	unsigned int len=strlen(name);
+    if (inode->ino==FUSE_ROOT_ID) {
 
-	call_info->pathinfo.path=malloc(len+2);
+	call_info->pathinfo.path=(char *) rootpath;
+	call_info->pathinfo.flags=0;
+	call_info->pathinfo.len=strlen(rootpath);
+	call_info->object=inode->object; /* inode is the rootinode, object is the rootobject */
 
-	if (call_info->pathinfo.path) {
-	    char *pathstart=call_info->pathinfo.path;
-
-	    *pathstart='/';
-	    pathstart++;
-
-	    memcpy(pathstart, name, len);
-
-	    pathstart+=len;
-	    *pathstart='\0';
-
-	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
-	    call_info->pathinfo.len=len+1;
-
-	} else {
-
-	    *error=ENOMEM;
-	    result=-1;
-
-	}
-
-    } else if (! lookup_pathcache(call_info)) {
-	unsigned int maxlen=pathmax, pathlen=0;
+    } else if (! lookup_pathcache(entry, call_info)) {
+	unsigned int maxlen=pathmax , pathlen=0;
 	char path[maxlen];
 	char *pathstart = NULL;
-	unsigned short len=0;
-	char *name=call_info->entry->name;
-	struct entry_struct *parent=call_info->entry->parent;
+	struct name_struct *name=NULL;
+	struct workspace_object_struct *object=NULL;
 
+	memset(path, '\0', maxlen);
 	pathstart = path + maxlen - 1;
-	*pathstart='\0';
 
-	len=strlen(name);
-	pathstart-=len;
-	memcpy(pathstart, name, len);
+	while (1) {
 
-	pathstart--;
-	*pathstart='/';
+	    name=&entry->name;
 
-	pathlen+=len+1;
+	    logoutput("get_path: add %s", name->name);
 
-	while (parent) {
-
-	    name=parent->name;
-
-	    len=strlen(name);
-	    pathstart-=len;
-	    memcpy(pathstart, name, len);
-
+	    pathstart-=name->len;
+	    memcpy(pathstart, name->name, name->len);
 	    pathstart--;
 	    *pathstart='/';
+	    pathlen+=name->len+1;
 
-	    pathlen+=len+1;
+	    /* test for and primary object and set the relative path to this object */
 
-	    parent=parent->parent;
+	    if (! call_info->object) {
 
-	    if ( isrootentry(parent) ) break;
+		object=inode->object;
+
+		if (object && object->primary==1) {
+
+		    call_info->object=object;
+		    call_info->relpath=name->len+1;
+
+		}
+
+	    } else {
+
+		call_info->relpath+=name->len+1;
+
+	    }
+
+	    /* go one entry higher */
+
+	    entry=entry->parent;
+	    inode=entry->inode;
+
+	    if (inode->ino==FUSE_ROOT_ID) {
+
+		if (! call_info->object) call_info->object=inode->object;
+		break;
+
+	    }
 
 	}
+
+	logoutput("get_path: found path %s, len %i, module calls %s, relpath %i", pathstart, pathlen, call_info->object->module_calls.name, call_info->relpath);
 
 	/* create a path just big enough */
 
@@ -372,14 +474,15 @@ int get_path(struct call_info_struct *call_info, unsigned int *error)
 
 }
 
-int get_path_extra(struct call_info_struct *call_info, const char *name, unsigned int *error)
+int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entry, struct name_struct *extraname, unsigned int *error)
 {
     int result=0;
+    struct inode_struct *inode=entry->inode;
 
-    if ( isrootentry(call_info->entry) ) {
-	unsigned short len=strlen(name);
+    if ( inode->ino==FUSE_ROOT_ID) {
+	struct name_struct *name=&entry->name;
 
-	call_info->pathinfo.path=malloc(len+2);
+	call_info->pathinfo.path=malloc(name->len + 2);
 
 	if (call_info->pathinfo.path) {
 	    char *pathstart=call_info->pathinfo.path;
@@ -387,13 +490,15 @@ int get_path_extra(struct call_info_struct *call_info, const char *name, unsigne
 	    *pathstart='/';
 	    pathstart++;
 
-	    memcpy(pathstart, name, len);
+	    memcpy(pathstart, name->name, name->len);
 
-	    pathstart+=len;
+	    pathstart+=name->len;
 	    *pathstart='\0';
 
 	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
-	    call_info->pathinfo.len=len+1;
+	    call_info->pathinfo.len=name->len+1;
+	    call_info->object=call_info->workspace_mount->rootinode.object;
+	    call_info->relpath=0;
 
 	} else {
 
@@ -402,40 +507,65 @@ int get_path_extra(struct call_info_struct *call_info, const char *name, unsigne
 
 	}
 
-    } else if (! lookup_pathcache(call_info)) {
-	unsigned short len=strlen(name);
-	unsigned int maxlen=pathmax + len + 1, pathlen=0;
+    } else if (! lookup_pathcache_extra(entry, call_info, extraname)) {
+	unsigned int maxlen=pathmax + extraname->len + 1, pathlen=0;
 	char path[maxlen + 1];
 	char *pathstart = NULL;
-	struct entry_struct *parent=call_info->entry;
+	struct workspace_object_struct *object=NULL;
 
 	pathstart = path + maxlen ;
 	*pathstart='\0';
 
-	pathstart-=len;
-	memcpy(pathstart, name, len);
+	pathstart-=extraname->len;
+	memcpy(pathstart, extraname->name, extraname->len);
 
 	pathstart--;
 	*pathstart='/';
 
-	pathlen+=len+1;
+	pathlen+=extraname->len+1;
 
-	while (parent) {
+	while (1) {
 
-	    name=parent->name;
+	    /* add name of parent to the start of path and add a slash */
 
-	    len=strlen(name);
-	    pathstart-=len;
-	    memcpy(pathstart, name, len);
+	    pathstart-=entry->name.len;
+	    memcpy(pathstart, entry->name.name, entry->name.len);
 
 	    pathstart--;
 	    *pathstart='/';
 
-	    pathlen+=len+1;
+	    pathlen+=entry->name.len+1;
 
-	    parent=parent->parent;
+	    /* test for and primary object and set the relative path to this object */
 
-	    if ( isrootentry(parent) ) break;
+	    if (call_info->object) {
+
+		object=inode->object;
+
+		if (object && object->primary==1) {
+
+		    call_info->object=object;
+		    call_info->relpath=entry->name.len+1;
+
+		}
+
+	    } else {
+
+		call_info->relpath+=entry->name.len+1;
+
+	    }
+
+	    /* go one entry higher */
+
+	    entry=entry->parent;
+	    inode=entry->inode;
+
+	    if (inode->ino==FUSE_ROOT_ID) {
+
+		if (! call_info->object) call_info->object=inode->object;
+		break;
+
+	    }
 
 	}
 
@@ -479,7 +609,7 @@ void free_path_pathinfo(struct pathinfo_struct *pathinfo)
 
 }
 
-void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry)
+void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry, struct workspace_object_struct *object, unsigned int relpath)
 {
 
     if ((pathinfo->flags & PATHINFOFLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFOFLAGS_INUSE)) {
@@ -496,6 +626,8 @@ void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry)
 		if (pathcache->entry==entry) {
 
 		    if (strcmp(pathcache->path, pathinfo->path)!=0) {
+
+			free(pathcache->path);
 
 			pathcache->path=pathinfo->path;
 			pathcache->len=pathinfo->len;
@@ -521,10 +653,10 @@ void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry)
 
 		    pathcache->path=pathinfo->path;
 		    pathcache->entry=entry;
+		    pathcache->object=object;
+		    pathcache->relpath=relpath;
 		    pathcache->len=pathinfo->len;
 		    get_current_time(&pathcache->eval_moment);
-
-		    pthread_mutex_lock(&pathcache_mutex);
 
 		    pathcache->next=pathcache_list;
 		    pathcache_list=pathcache;

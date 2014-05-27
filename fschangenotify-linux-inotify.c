@@ -175,7 +175,22 @@ int set_watch_backend_inotify(struct notifywatch_struct *watch)
 
     logoutput("set_watch_backend_inotify");
 
-    /* first translate the fsnotify mask into a inotify mask */
+    /*
+	test the the underlying fs works with inotify
+	for example /proc and /sys do not support inotify
+	change this test 
+    */
+
+    if (issubdirectory(watch->pathinfo.path, "/proc", 1)==1 || issubdirectory(watch->pathinfo.path, "/sys", 1)==1) {
+
+	error=ENOSYS;
+	goto out;
+
+    }
+
+    /*
+	translate the fsnotify mask into a inotify mask
+    */
 
     inotify_mask=translate_mask_fsnotify_to_inotify(watch->mask);
 
@@ -219,7 +234,7 @@ int set_watch_backend_inotify(struct notifywatch_struct *watch)
 
 		    inotify_watch->watch=watch;
 
-		    watch->backend=(void *) inotify_watch;
+		    watch->data=(void *) inotify_watch;
 
 		}
 
@@ -234,7 +249,7 @@ int set_watch_backend_inotify(struct notifywatch_struct *watch)
 
 		    add_watch_inotifytable(inotify_watch);
 
-		    watch->backend=(void *) inotify_watch;
+		    watch->data=(void *) inotify_watch;
 
 		}
 
@@ -254,7 +269,7 @@ int set_watch_backend_inotify(struct notifywatch_struct *watch)
 
     out:
 
-    return (error>0) ? error : wd;
+    return (error>0) ? -error : wd;
 
 }
 
@@ -269,7 +284,9 @@ int change_watch_backend_inotify(struct notifywatch_struct *watch)
 
 void remove_watch_backend_inotify(struct notifywatch_struct *watch)
 {
-    struct inotify_watch_struct *inotify_watch=(struct inotify_watch_struct *) watch->backend;
+    struct inotify_watch_struct *inotify_watch=(struct inotify_watch_struct *) watch->data;
+
+    logoutput("remove_watch_backend_inotify");
 
     /* lookup the inotify watch, if it's ok then it does not exist already */
 
@@ -280,7 +297,7 @@ void remove_watch_backend_inotify(struct notifywatch_struct *watch)
 
 	res=inotify_rm_watch(xdata_inotify.fd, inotify_watch->wd);
 
-	watch->backend=NULL;
+	watch->data=NULL;
 	free(inotify_watch);
 
     }
@@ -291,11 +308,22 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 {
     struct notifywatch_struct *watch=inotify_watch->watch;
     struct pathinfo_struct pathinfo={NULL, 0, 0};
-    uint32_t fsnotify_mask=0;
-    struct inode_struct *inode=watch->inode;
-    struct entry_struct *parent=inode->alias;
+    struct inode_struct *pinode=watch->inode;
+    struct entry_struct *parent=pinode->alias;
+    char maskstring[256];
+    struct name_struct xname={NULL, 0, 0};
+    unsigned int error=0;
 
-    logoutput("evaluate_fsevent_inotify_indir: %s changed (%i)", i_event->name, i_event->mask);
+    xname.name=(char *) i_event->name;
+    xname.len=strlen(xname.name);
+
+    calculate_nameindex(&xname);
+
+    memset(maskstring, '\0', 80);
+
+    print_mask(i_event->mask, maskstring, 80);
+
+    logoutput("evaluate_fsevent_inotify_indir: (%i:%s) on %s (index: %lli, len %i)", i_event->mask, maskstring, i_event->name, xname.index, xname.len);
 
     if ( !(i_event->mask & IN_DELETE) && !(i_event->mask & IN_MOVED_FROM)){
 	struct stat st;
@@ -317,12 +345,12 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 	/* this should not give an error */
 
 	if (lstat(pathinfo.path, &st)==0) {
-	    unsigned int row=0;
-	    unsigned int error=0;
 
-	    entry=find_entry_by_name_sl(parent, i_event->name, &row, &error);
+	    entry=find_entry(parent, &xname, &error);
 
 	    if (entry) {
+		uint32_t mask=0;
+		struct inode_struct *inode=entry->inode;
 
 		inode=entry->inode;
 
@@ -330,61 +358,10 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 		    compare stat with cached values
 		*/
 
-		if (inode->mode != st.st_mode) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->mode = st.st_mode;
-
-		}
-
-		if (inode->uid != st.st_uid) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->uid = st.st_uid;
-
-		}
-
-		if (inode->gid != st.st_gid) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->gid = st.st_gid;
-
-		}
-
-		if (! S_ISDIR(st.st_mode) && inode->type.size != st.st_size) {
-
-		    fsnotify_mask |= IN_MODIFY;
-		    inode->type.size = st.st_size;
-
-		}
-
-		if (!(inode->mtim.tv_sec==st.st_mtim.tv_sec) || !(inode->mtim.tv_nsec==st.st_mtim.tv_nsec)) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->mtim.tv_sec=st.st_mtim.tv_sec;
-		    inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
-
-		}
-
-		if (!(inode->ctim.tv_sec==st.st_ctim.tv_sec) || !(inode->ctim.tv_nsec==st.st_ctim.tv_nsec)) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->ctim.tv_sec=st.st_ctim.tv_sec;
-		    inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
-
-		}
-
+		mask=determine_fsnotify_mask(inode, &st);
 		get_current_time(&entry->synctime);
 
-		/* pass through other values */
-
-		if (i_event->mask & IN_MODIFY) fsnotify_mask |= IN_MODIFY;
-		if (i_event->mask & IN_ACCESS) fsnotify_mask |= IN_ACCESS;
-		if (i_event->mask & IN_CLOSE_WRITE) fsnotify_mask |= IN_CLOSE_WRITE;
-		if (i_event->mask & IN_CLOSE_NOWRITE) fsnotify_mask |= IN_CLOSE_NOWRITE;
-		if (i_event->mask & IN_OPEN) fsnotify_mask |= IN_OPEN;
-
-		logoutput("evaluate_fsevent_inotify_indir: fsnotify mask %i on existing %s", fsnotify_mask, i_event->name);
+		logoutput("evaluate_fsevent_inotify_indir: (%i:%s) %s found: mask %i", i_event->mask, maskstring, i_event->name, mask);
 
 		/*
 		    here call the right fuse_lowlevel_notify_ function, with what parameters
@@ -393,58 +370,65 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 
 	    } else {
 
-		entry=insert_entry_sl(parent, i_event->name, &row, &error, create_entry_cb, NULL);
+		if (error==ENOTDIR || error==ENOENT) {
+		    struct inode_struct *inode=NULL;
 
-		if (entry) {
+		    error=0;
 
-		    inode=entry->inode;
+		    entry=create_entry(parent, &xname);
+		    inode=create_inode();
 
-		    if (i_event->mask & IN_MOVED_TO) {
+		    if (entry && inode) {
 
-			fsnotify_mask |= IN_MOVED_TO;
+			entry->inode=inode;
+			inode->alias=entry;
+
+			add_inode_hashtable(inode, increase_inodes_workspace, (void *) watch->object->workspace_mount);
+
+			insert_entry(entry, &error, 0);
+
+			inode->mode = st.st_mode;
+			inode->uid = st.st_uid;
+			inode->gid = st.st_gid;
+			inode->nlink = st.st_nlink;
+
+			if (! S_ISDIR(st.st_mode)) inode->size = st.st_size;
+
+			inode->mtim.tv_sec=st.st_mtim.tv_sec;
+			inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+			inode->ctim.tv_sec=st.st_ctim.tv_sec;
+			inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+			inode->rdev=st.st_rdev;
+
+			get_current_time(&entry->synctime);
+
+			logoutput("evaluate_fsevent_inotify_indir: (%i:%s) on new %s", i_event->mask, maskstring, i_event->name);
+
+			queue_create(watch->object, entry, &error);
 
 		    } else {
 
-			fsnotify_mask |= IN_CREATE;
+			error=ENOMEM;
+
+			if (entry) {
+
+			    destroy_entry(entry);
+			    entry=NULL;
+
+			}
+
+			if (inode) {
+
+			    free(inode);
+			    inode=NULL;
+
+			}
+
+			goto out;
 
 		    }
-
-		    inode->mode = st.st_mode;
-		    inode->uid = st.st_uid;
-		    inode->gid = st.st_gid;
-		    inode->nlink = st.st_nlink;
-
-		    if (! S_ISDIR(st.st_mode)) inode->type.size = st.st_size;
-
-		    inode->mtim.tv_sec=st.st_mtim.tv_sec;
-		    inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
-
-		    inode->ctim.tv_sec=st.st_ctim.tv_sec;
-		    inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
-
-		    inode->rdev=st.st_rdev;
-
-		    get_current_time(&entry->synctime);
-
-		    logoutput("evaluate_fsevent_inotify_indir: fsnotify mask %i on new %s", fsnotify_mask, i_event->name);
-
-		    /*
-			here call a new fuse_lowlevel_add function
-
-			something like:
-
-			fuse_lowlevel_add(struct fuse_chan chan, fuse_ino_t parentino, char *name, size_t len);
-
-			and what will this do?
-			the kernel should send a lookup request for this entry for example, and when that is succesfull,
-			notify fsnotify for a new entry
-		    */
-
-		    notify_kernel_create(parent->inode->ino, i_event->name);
-
-		} else {
-
-		    goto out;
 
 		}
 
@@ -452,7 +436,6 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 
 
 	} else {
-
 
 	    if (errno==ENOENT) {
 
@@ -468,32 +451,18 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 
     if ((i_event->mask & IN_DELETE) || (i_event->mask & IN_MOVED_FROM)) {
 	unsigned int row=0;
-	unsigned int error=0;
+
 	struct entry_struct *entry=NULL;
 
-	logoutput("evaluate_fsevent_inotify_indir: %s deleted", i_event->name);
+	logoutput("evaluate_fsevent_inotify_indir: (%i:%s): %s deleted", i_event->mask, maskstring, i_event->name);
 
-	entry=find_entry_by_name_sl(parent, i_event->name, &row, &error);
+	entry=find_entry(parent, &xname, &error);
 
 	if (entry) {
 
-	    if (S_ISDIR(entry->inode->mode)) remove_directory_recursive(entry);
-
-	    delete_entry_sl(entry, &row, &error);
-
-	    if (error==0) {
-
-		logoutput("evaluate_fsevent_inotify_indir: %s is found at row %i and deleted", i_event->name, row);
-
-		notify_kernel_delete(parent->inode->ino, entry->inode->ino, i_event->name);
-
-		remove_entry(entry);
-
-	    } else {
-
-		logoutput("evaluate_fsevent_inotify_indir: %s is found at row %i and not deleted (error=%i)", i_event->name, row, error);
-
-	    }
+	    error=0;
+	    remove_entry(entry, &error);
+	    queue_remove(watch->object, entry, &error);
 
 	} else {
 
@@ -503,7 +472,15 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 
     }
 
-    logoutput("evaluate_fsevent_inotify_indir: ready for %s (%i)", i_event->name, i_event->mask);
+    if (error==0) {
+
+	logoutput("evaluate_fsevent_inotify_indir: ready for (%i:%s) %s", i_event->mask, maskstring, i_event->name);
+
+    } else {
+
+	logoutput("evaluate_fsevent_inotify_indir: error %i for (%i:%s) %s", error, i_event->mask, maskstring, i_event->name);
+
+    }
 
     out:
 
@@ -517,43 +494,7 @@ void evaluate_fsevent_inotify_ondir(struct inotify_watch_struct *inotify_watch, 
     struct inode_struct *inode=watch->inode;
     struct entry_struct *entry=inode->alias;
 
-    if ( (i_event->mask & IN_DELETE) || (i_event->mask & IN_MOVED_FROM) ) {
-	unsigned int row=0;
-	unsigned int error=0;
-
-	/* inode with watch is deleted */
-
-	if (S_ISDIR(inode->mode)) remove_directory_recursive(entry);
-
-	watch->mask=0;
-
-	change_notifywatch(watch);
-
-	delete_entry_sl(entry, &row, &error);
-
-	if (error==0) {
-	    struct entry_struct *parent=entry->parent;
-
-	    logoutput("evaluate_fsevent_inotify_ondir: %s is found at row %i and deleted", i_event->name, row);
-
-	    if (parent) notify_kernel_delete(parent->inode->ino, entry->inode->ino, i_event->name);
-
-	    remove_entry(entry);
-
-	} else {
-
-	    logoutput("evaluate_fsevent_inotify_ondir: %s is found at row %i and not deleted (error=%i)", i_event->name, row, error);
-
-	}
-
-    } else {
-	uint32_t fsnotify_mask=0;
-
-	if (i_event->mask & IN_MODIFY) fsnotify_mask |= IN_MODIFY;
-	if (i_event->mask & IN_ACCESS) fsnotify_mask |= IN_ACCESS;
-	if (i_event->mask & IN_CLOSE_WRITE) fsnotify_mask |= IN_CLOSE_WRITE;
-	if (i_event->mask & IN_CLOSE_NOWRITE) fsnotify_mask |= IN_CLOSE_NOWRITE;
-	if (i_event->mask & IN_OPEN) fsnotify_mask |= IN_OPEN;
+    if ( !(i_event->mask & IN_DELETE) && !(i_event->mask & IN_MOVED_FROM) ) {
 
 	if ( i_event->mask & IN_ATTRIB ) {
 	    char *path=watch->pathinfo.path;
@@ -570,58 +511,30 @@ void evaluate_fsevent_inotify_ondir(struct inotify_watch_struct *inotify_watch, 
 		i_event->mask|=IN_DELETE;
 
 	    } else {
+		uint32_t mask=0;
+		unsigned int error=0;
+
+		mask=determine_fsnotify_mask(inode, &st);
 
 		get_current_time(&entry->synctime);
 
-		if (inode->mode != st.st_mode) {
+		logoutput("evaluate_fsevent_inotify_ondir: fsnotify mask %i on %s", mask, entry->name.name);
 
-		    inode->mode=st.st_mode;
-		    fsnotify_mask |= IN_ATTRIB;
-
-		}
-
-		if (inode->uid != st.st_uid) {
-
-		    inode->uid=st.st_uid;
-		    fsnotify_mask |= IN_ATTRIB;
-
-		}
-
-		if (inode->gid != st.st_gid) {
-
-		    inode->gid=st.st_gid;
-		    fsnotify_mask |= IN_ATTRIB;
-
-		}
-
-		if (! S_ISDIR(st.st_mode) && inode->type.size != st.st_size) {
-
-		    fsnotify_mask |= IN_MODIFY;
-		    inode->type.size = st.st_size;
-
-		}
-
-		if (!(inode->mtim.tv_sec==st.st_mtim.tv_sec) || !(inode->mtim.tv_nsec==st.st_mtim.tv_nsec)) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->mtim.tv_sec=st.st_mtim.tv_sec;
-		    inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
-
-		}
-
-		if (!(inode->ctim.tv_sec==st.st_ctim.tv_sec) || !(inode->ctim.tv_nsec==st.st_ctim.tv_nsec)) {
-
-		    fsnotify_mask |= IN_ATTRIB;
-		    inode->ctim.tv_sec=st.st_ctim.tv_sec;
-		    inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
-
-		}
+		if (mask>0) queue_change(watch->object, entry, mask, &error);
 
 	    }
 
 	}
 
-	logoutput("evaluate_fsevent_inotify_ondir: fsnotify mask %i on %s", fsnotify_mask, entry->name);
+    }
+
+    if ( (i_event->mask & IN_DELETE) || (i_event->mask & IN_MOVED_FROM) ) {
+	unsigned int error=0;
+
+	change_notifywatch(watch, 0);
+
+	remove_entry(entry, &error);
+	queue_remove(watch->object, entry, &error);
 
     }
 
@@ -640,18 +553,69 @@ void evaluate_fsevent_inotify(struct inotify_event *i_event)
 	inotify_watch=lookup_inotify_watch_wd(i_event->wd);
 
 	if (inotify_watch) {
+	    struct notifywatch_struct *watch=inotify_watch->watch;
 
-	    if (i_event->len>0) {
+	    if (watch->inode && (watch->notifymask & i_event->mask)) {
 
-		/* event on entry in directory */
+		if (i_event->len>0) {
 
-		evaluate_fsevent_inotify_indir(inotify_watch, i_event);
+		    /* event on entry in directory */
 
-	    } else {
+		    evaluate_fsevent_inotify_indir(inotify_watch, i_event);
 
-		/* event on entry of watch */
+		} else {
 
-		evaluate_fsevent_inotify_ondir(inotify_watch, i_event);
+		    /* event on entry of watch */
+
+		    evaluate_fsevent_inotify_ondir(inotify_watch, i_event);
+
+		}
+
+		if (i_event->mask & (IN_DELETE_SELF | IN_IGNORED)) {
+
+		    if (watch->cb==NULL) {
+
+			change_notifywatch(watch, 0);
+
+		    } else {
+
+			remove_watch_inodetable(watch);
+
+		    }
+
+		}
+
+	    }
+
+	    if (watch->cb) {
+
+		if (i_event->name) {
+
+		    if (i_event->mask & (IN_CREATE | IN_MOVED_TO)) {
+
+			if (watch->cb->create) (*watch->cb->create) (watch, i_event->name);
+
+		    } else if (i_event->mask & (IN_DELETE | IN_MOVED_FROM)) {
+
+			if (watch->cb->remove) (*watch->cb->remove) (watch, i_event->name);
+
+		    } else if (i_event->mask & (IN_ATTRIB | IN_MODIFY)) {
+
+			if (watch->cb->change) (*watch->cb->change) (watch, i_event->name);
+
+		    }
+
+		} else {
+
+		    if (i_event->mask & (IN_DELETE_SELF | IN_IGNORED)) {
+
+			if (watch->cb->destroy) (*watch->cb->destroy) (watch);
+
+		    }
+
+		}
+
+		if (i_event->mask & (IN_DELETE_SELF | IN_IGNORED)) remove_systemwatch(watch);
 
 	    }
 

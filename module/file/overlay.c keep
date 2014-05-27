@@ -1,0 +1,3088 @@
+/*
+  2010, 2011, 2012, 2103, 2014 Stef Bon <stefbon@gmail.com>
+
+  This program is free software; you can redistribute it and/or
+  modify it under the terms of the GNU General Public License
+  as published by the Free Software Foundation; either version 2
+  of the License, or (at your option) any later version.
+
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
+
+  You should have received a copy of the GNU General Public License
+  along with this program; if not, write to the Free Software
+  Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+
+*/
+
+#include "global-defines.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <dirent.h>
+#include <errno.h>
+#include <err.h>
+#include <sys/time.h>
+#include <time.h>
+#include <pthread.h>
+#include <ctype.h>
+#include <inttypes.h>
+
+#include <sys/param.h>
+#include <sys/types.h>
+#include <sys/fsuid.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <math.h>
+#include <sys/vfs.h>
+
+#ifdef HAVE_SETXATTR
+#include <sys/xattr.h>
+#endif
+
+#ifndef ENOATTR
+#define ENOATTR ENODATA        /* No such attribute */
+#endif
+
+#ifdef LOGGING
+
+#include <syslog.h>
+
+static unsigned char loglevel=1;
+
+#define logoutput_debug(...) if (loglevel >= 5) syslog(LOG_DEBUG, __VA_ARGS__)
+#define logoutput_info(...) if (loglevel >= 4) syslog(LOG_INFO, __VA_ARGS__)
+#define logoutput_notice(...) if (loglevel >= 3) syslog(LOG_NOTICE, __VA_ARGS__)
+#define logoutput_warning(...) if (loglevel >= 2) syslog(LOG_WARNING, __VA_ARGS__)
+#define logoutput_error(...) if (loglevel >= 1) syslog(LOG_ERR, __VA_ARGS__)
+
+#define logoutput(...) if (loglevel >= 1) syslog(LOG_DEBUG, __VA_ARGS__)
+
+#else
+
+static inline void dummy_nolog()
+{
+    return;
+
+}
+
+#define logoutput_debug(...) dummy_nolog()
+#define logoutput_info(...) dummy_nolog()
+#define logoutput_notice(...) dummy_nolog()
+#define logoutput_warning(...) dummy_nolog()
+#define logoutput_error(...) dummy_nolog()
+
+#endif
+
+#include "fuse-workspace.h"
+#include "workerthreads.h"
+#include "beventloop-utils.h"
+
+#include "entry-management.h"
+
+#include "path-resolution.h"
+#include "utils.h"
+#include "options.h"
+
+#include "fschangenotify.h"
+#include "fschangenotify-event.h"
+#include "fschangenotify-fssync.h"
+
+#include "readdir-utils.h"
+
+#include "workspaces.h"
+
+struct fs_options_struct fs_options;
+struct workerthreads_queue_struct workerthreads_queue;
+struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
+
+extern const char *rootpath;
+extern const char *dotdotname;
+extern const char *dotname;
+
+static void overlayfs_lookup_cached(fuse_req_t req, struct entry_struct *entry, struct call_info_struct *call_info)
+{
+    char *path=NULL;
+    struct stat st;
+
+    path=call_info->pathinfo.path + call_info->relpath;
+    if (strlen(path)==0) path=rootpath;
+
+    memset(&st, 0, sizeof(struct stat));
+
+    logoutput("overlayfs_lookup_cached, path %s", path);
+
+    if (lstat(path, &st)==-1) {
+	struct inode_struct *inode=entry->inode;
+	unsigned int error=0;
+
+	inode=entry->inode;
+	inode->alias=NULL;
+
+	remove_entry(entry, &error);
+	queue_remove(call_info->object, entry, &error);
+	entry=NULL;
+
+	fuse_reply_err(req, ENOENT);
+
+    } else {
+	struct fuse_entry_param e;
+
+	e.ino = inode->ino;
+	e.generation = 1;
+	e.attr_timeout = fs_options.attr_timeout;
+	e.entry_timeout = fs_options.entry_timeout;
+
+	e.attr.st_ino = e.ino;
+	e.attr.st_mode = st.st_mode;
+	e.attr.st_nlink = st.st_nlink;
+	e.attr.st_uid = st.st_uid;
+	e.attr.st_gid = st.st_gid;
+	e.attr.st_rdev = st.st_rdev;
+	e.attr.st_atim.tv_sec = st.st_atim.tv_sec;
+	e.attr.st_atim.tv_nsec = st.st_atim.tv_nsec;
+	e.attr.st_mtim.tv_sec = st.st_mtim.tv_sec;
+	e.attr.st_mtim.tv_nsec = st.st_mtim.tv_nsec;
+	e.attr.st_ctim.tv_sec = st.st_ctim.tv_sec;
+	e.attr.st_ctim.tv_nsec = st.st_ctim.tv_nsec;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	inode->mode=st.st_mode;
+	inode->nlink=st.st_nlink;
+	inode->uid=st.st_uid;
+	inode->gid=st.st_gid;
+
+	inode->rdev=st.st_rdev;
+
+	if (S_ISDIR(st.st_mode)) {
+
+	    e.attr.st_size = 0;
+
+	} else {
+
+	    inode->size=st.st_size;
+	    e.attr.st_size = st.st_size;
+
+	}
+
+	inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+	inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+	fuse_reply_entry(req, &e);
+
+    }
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+static void overlayfs_lookup_noncached(fuse_req_t req, struct entry_struct *pinode, struct name_struct *xname, struct call_info_struct *call_info)
+{
+    char *path=NULL;
+    struct stat st;
+
+    path=call_info->pathinfo.path + call_info->relpath;
+    if (strlen(path)==0) path=rootpath;
+
+    memset(&st, 0, sizeof(struct stat));
+
+    logoutput("overlayfs_lookup_cached, path %s", path);
+
+    if (lstat(path, &st)==-1) {
+
+	fuse_reply_err(req, ENOENT);
+
+    } else {
+	struct entry_struct *entry=NULL, *parent=pinode->alias;
+	struct inode_struct *inode;
+
+	entry=create_entry(parent, xname);
+	inode=create_inode();
+
+	if (entry && inode) {
+	    struct fuse_entry_param e;
+	    unsigned int error=0;
+
+	    add_inode_hashtable(inode);
+	    insert_entry(entry, &error, 0);
+
+	    adjust_pathmax(call_info->pathinfo.len);
+
+	    e.ino = inode->ino;
+	    e.generation = 1;
+	    e.attr_timeout = fs_options.attr_timeout;
+	    e.entry_timeout = fs_options.entry_timeout;
+
+	    e.attr.st_ino = e.ino;
+	    e.attr.st_mode = st.st_mode;
+	    e.attr.st_nlink = st.st_nlink;
+	    e.attr.st_uid = st.st_uid;
+	    e.attr.st_gid = st.st_gid;
+	    e.attr.st_rdev = st.st_rdev;
+	    e.attr.st_atim.tv_sec = st.st_atim.tv_sec;
+	    e.attr.st_atim.tv_nsec = st.st_atim.tv_nsec;
+	    e.attr.st_mtim.tv_sec = st.st_mtim.tv_sec;
+	    e.attr.st_mtim.tv_nsec = st.st_mtim.tv_nsec;
+	    e.attr.st_ctim.tv_sec = st.st_ctim.tv_sec;
+	    e.attr.st_ctim.tv_nsec = st.st_ctim.tv_nsec;
+
+	    e.attr.st_blksize=4096;
+	    e.attr.st_blocks=0;
+
+	    inode->mode=st.st_mode;
+	    inode->nlink=st.st_nlink;
+	    inode->uid=st.st_uid;
+	    inode->gid=st.st_gid;
+
+	    inode->rdev=st.st_rdev;
+
+	    if (S_ISDIR(st.st_mode)) {
+
+		e.attr.st_size = 0;
+
+	    } else {
+
+		inode->size=st.st_size;
+		e.attr.st_size = st.st_size;
+
+	    }
+
+	    inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	    inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+	    inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	    inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+	    fuse_reply_entry(req, &e);
+
+	} else {
+
+	    /* not enough memory to allocate entry and/or inode */
+
+	    if (entry) {
+
+		destroy_entry(entry);
+		entry=NULL;
+
+	    }
+
+	    if (inode) {
+
+		free(inode);
+		inode=NULL;
+
+	    }
+
+	    fuse_reply_err(req, ENOMEM);
+
+	}
+
+    }
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+static void overlayfs_getattr(fuse_req_t req, struct entry_struct *entry, struct call_info_struct *call_info)
+{
+    char *path=NULL;
+    struct stat st;
+
+    path=call_info->pathinfo.path + call_info->relpath;
+    if (strlen(path)==0) path=rootpath;
+
+    memset(&st, 0, sizeof(struct stat));
+
+    logoutput("overlayfs_getattr, path %s", path);
+
+    if (lstat(path, &st)==-1) {
+
+	fuse_reply_err(req, ENOENT);
+
+    } else {
+
+	inode->mode=st.st_mode;
+	inode->nlink=st.st_nlink;
+	inode->uid=st.st_uid;
+	inode->gid=st.st_gid;
+	inode->rdev=st.st_rdev;
+
+	if (S_ISDIR(st.st_mode)) {
+
+	    st.st_size=0;
+
+	} else {
+
+	    inode->size=st.st_size;
+
+	}
+
+	inode->mtim.tv_sec=st.st_mtim.tv_sec;
+	inode->mtim.tv_nsec=st.st_mtim.tv_nsec;
+
+	inode->ctim.tv_sec=st.st_ctim.tv_sec;
+	inode->ctim.tv_nsec=st.st_ctim.tv_nsec;
+
+	st.st_ino=inode->ino;
+	st.st_dev=0;
+
+	fuse_reply_attr(req, &st, fs_options.attr_timeout);
+
+    }
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+static void overlayfs_mkdir(fuse_req_t req, struct inode_struct *pinode, struct name_struct *xname, struct call_info_struct *call_info, mode_t mode)
+{
+    struct entry_struct *entry=NULL;
+    struct inode_struct *pinode;
+    char *path=NULL;
+
+    path=call_info->pathinfo.path + call_info->relpath;
+
+    entry=create_entry(parent, &xname);
+    inode=create_inode();
+
+    if (entry && inode) {
+	struct entry_struct *result=NULL;
+	unsigned int error=0;
+
+	entry->inode=inode;
+	inode->alias=entry;
+
+	result=insert_entry(entry, &error, _ENTRY_FLAG_TEMP);
+
+	if (result==entry) {
+	    uid_t uid_keep=setfsuid(call_info->uid);
+	    gid_t gid_keepsetfsgid(call_info->gid);
+	    mode_t umask_keep=umask(call_info->umask);
+
+	    mode = (mode & 01777 & ~call_info->umask ) | S_IFDIR;
+
+	    if (mkdir(path, mode)==0) {
+    		struct fuse_entry_param e;
+
+		adjust_pathmax(call_info.pathinfo.len);
+		add_inode_hashtable(inode);
+
+		/* here complete the insert ?? */
+
+		inode->mode=mode;
+
+		inode->nlink=2;
+		inode->uid=call_info->uid;
+		inode->gid=call_info->gid;
+		inode->nlookup=1;
+
+		inode->rdev=0;
+		inode->size=0;
+
+		get_current_time(&inode->mtim);
+		memcpy(&inode->ctim, &inode->mtim, sizeof(struct timespec));
+
+		memset(&e, 0, sizeof(e));
+
+		e.ino = inode->ino;
+		e.generation = 1;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_dev = 0;
+		e.attr.st_uid=inode->uid;
+		e.attr.st_gid=inode->gid;
+		e.attr.st_size=inode->size;
+		e.attr.st_rdev=inode->rdev;
+
+		memcpy(&e.attr.st_mtim, &inode->mtim, sizeof(struct timespec));
+		memcpy(&e.attr.st_ctim, &inode->mtim, sizeof(struct timespec));
+		memcpy(&e.attr.st_atim, &inode->mtim, sizeof(struct timespec));
+
+		e.attr_timeout = fs_options.attr_timeout;
+		e.entry_timeout = fs_options.entry_timeout;
+
+		e.attr.st_blksize=4096;
+		e.attr.st_blocks=0;
+
+    		fuse_reply_entry(req, &e);
+
+	    } else {
+		unsigned int error_delete=0;
+
+		error=errno;
+
+		remove_entry(entry, &error_delete);
+
+		destroy_entry(entry);
+		entry=NULL;
+
+		free(inode);
+		inode=NULL;
+
+		fuse_reply_err(req, error);
+
+	    }
+
+	    uid_keep=setfsuid(uid_keep);
+	    gid_keep=setfsgid(gid_keep);
+	    umask_keep=umask(umask_keep);
+
+	} else {
+
+	    destroy_entry(entry);
+	    entry=NULL;
+
+	    free(inode);
+	    inode=NULL;
+
+	    if (error==0) error=EEXIST;
+
+	    fuse_reply_err(req, error);
+
+	}
+
+    } else {
+
+	if (entry) {
+
+	    destroy_entry(entry);
+	    entry=NULL;
+
+	}
+
+	if (inode) {
+
+	    free(inode);
+	    inode=NULL;
+
+	}
+
+	fuse_reply_err(req, ENOMEM);
+
+    }
+
+}
+
+static void overlayfs_mknod(fuse_req_t req, struct inode_struct *pinode, struct name_struct *xname, struct call_info_struct *call_info, mode_t mode, dev_t rdev)
+{
+    struct entry_struct *entry=NULL;
+    struct inode_struct *pinode;
+    char *path=NULL;
+
+    path=call_info->pathinfo.path + call_info->relpath;
+
+    entry=create_entry(parent, &xname);
+    inode=create_inode();
+
+    if (entry && inode) {
+	struct entry_struct *result=NULL;
+	unsigned int error=0;
+
+	entry->inode=inode;
+	inode->alias=entry;
+
+	result=insert_entry(entry, &error, _ENTRY_FLAG_TEMP);
+
+	if (result==entry) {
+	    uid_t uid_keep=setfsuid(call_info->uid);
+	    gid_t gid_keepsetfsgid(call_info->gid);
+	    mode_t umask_keep=umask(call_info->umask);
+
+	    mode = (mode & ~call_info->umask);
+
+	    if (mknod(path, mode, rdev)==0) {
+    		struct fuse_entry_param e;
+
+		adjust_pathmax(call_info.pathinfo.len);
+		add_inode_hashtable(inode);
+
+		/* here complete the insert ?? */
+
+		inode->mode=mode;
+
+		inode->nlink=1;
+		inode->uid=call_info->uid;
+		inode->gid=call_info->gid;
+		inode->nlookup=1;
+
+		inode->rdev=rdev;
+		inode->size=0;
+
+		get_current_time(&inode->mtim);
+		memcpy(&inode->ctim, &inode->mtim, sizeof(struct timespec));
+
+		memset(&e, 0, sizeof(e));
+
+		e.ino = inode->ino;
+		e.generation = 1;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_dev = 0;
+		e.attr.st_uid=inode->uid;
+		e.attr.st_gid=inode->gid;
+		e.attr.st_size=inode->size;
+		e.attr.st_rdev=inode->rdev;
+
+		memcpy(&e.attr.st_mtim, &inode->mtim, sizeof(struct timespec));
+		memcpy(&e.attr.st_ctim, &inode->mtim, sizeof(struct timespec));
+		memcpy(&e.attr.st_atim, &inode->mtim, sizeof(struct timespec));
+
+		e.attr_timeout = fs_options.attr_timeout;
+		e.entry_timeout = fs_options.entry_timeout;
+
+		e.attr.st_blksize=4096;
+		e.attr.st_blocks=0;
+
+    		fuse_reply_entry(req, &e);
+
+	    } else {
+		unsigned int error_delete=0;
+
+		error=errno;
+
+		remove_entry(entry, &error_delete);
+
+		destroy_entry(entry);
+		entry=NULL;
+
+		free(inode);
+		inode=NULL;
+
+		fuse_reply_err(req, error);
+
+	    }
+
+	    uid_keep=setfsuid(uid_keep);
+	    gid_keep=setfsgid(gid_keep);
+	    umask_keep=umask(umask_keep);
+
+	} else {
+
+	    destroy_entry(entry);
+	    entry=NULL;
+
+	    free(inode);
+	    inode=NULL;
+
+	    if (error==0) error=EEXIST;
+
+	    fuse_reply_err(req, error);
+
+	}
+
+    } else {
+
+	if (entry) {
+
+	    destroy_entry(entry);
+	    entry=NULL;
+
+	}
+
+	if (inode) {
+
+	    free(inode);
+	    inode=NULL;
+
+	}
+
+	fuse_reply_err(req, ENOMEM);
+
+    }
+
+}
+
+static void overlayfs_create(fuse_req_t req, fuse_ino_t ino, const char *name, mode_t mode, struct fuse_file_info *fi)
+{
+    struct entry_struct *entry=NULL;
+    struct inode_struct *pinode;
+    unsigned int error=0;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+
+    logoutput("CREATE, name: %s", name);
+
+    pinode=find_inode(ino);
+
+    if (pinode) {
+	struct entry_struct *parent=pinode->alias;
+	struct name_struct xname={NULL, 0, 0};
+
+	xname.name=(char *) name;
+	xname.len=strlen(name);
+
+	calculate_nameindex(&xname);
+
+	entry=find_entry(parent, &xname, &error);
+
+	if ( ! entry ) {
+	    struct call_info_struct call_info=CALL_INFO_INIT;
+	    struct inode_struct *inode=NULL;
+
+	    call_info.entry=parent;
+	    call_info.pid=ctx->pid;
+	    call_info.uid=ctx->uid;
+	    call_info.gid=ctx->gid;
+	    call_info.umask=ctx->umask;
+
+	    call_info.pathinfo.path=NULL;
+	    call_info.pathinfo.len=0;
+	    call_info.pathinfo.flags=0;
+
+	    entry=create_entry(parent, &xname);
+	    inode=create_inode();
+
+	    if (entry && inode) {
+
+		entry->inode=inode;
+		inode->alias=entry;
+
+		if (get_path_extra(&call_info, &xname, &error)==0) {
+		    struct entry_struct *result=NULL;
+
+		    error=0;
+
+		    result=insert_entry(entry, &error, _ENTRY_FLAG_TEMP);
+
+		    if (result==entry) {
+			uid_t uid_keep;
+			gid_t gid_keep;
+			mode_t umask_keep;
+			int fd=0;
+
+			/* change to uid/gid/umask of user */
+
+			uid_keep=setfsuid(call_info.uid);
+			gid_keep=setfsgid(call_info.gid);
+			umask_keep=umask(call_info.umask);
+
+			fd=creat(call_info.pathinfo.path, mode);
+
+			if (fd>0) {
+
+			    adjust_pathmax(call_info.pathinfo.len);
+
+			    assign_ino(inode);
+			    add_inode_hashtable(inode);
+
+			    fi->fh=fd;
+
+			} else {
+			    unsigned int error_delete=0;
+
+			    error=errno;
+
+			    remove_entry(entry, &error_delete);
+
+			    destroy_entry(entry);
+			    entry=NULL;
+
+			    free(inode);
+			    inode=NULL;
+
+			}
+
+			uid_keep=setfsuid(uid_keep);
+			gid_keep=setfsgid(gid_keep);
+			umask_keep=umask(umask_keep);
+
+		    } else {
+
+			destroy_entry(entry);
+			entry=NULL;
+
+			free(inode);
+			inode=NULL;
+
+			if (error==0) error=EEXIST;
+
+		    }
+
+		} else {
+
+		    destroy_entry(entry);
+		    entry=NULL;
+
+		    free(inode);
+		    inode=NULL;
+
+		}
+
+	    } else {
+
+		if (entry) {
+
+		    destroy_entry(entry);
+		    entry=NULL;
+
+		}
+
+		if (inode) {
+
+		    free(inode);
+		    inode=NULL;
+
+		}
+
+		error=ENOMEM;
+
+	    }
+
+	    free_path_pathinfo(&call_info.pathinfo);
+
+	} else {
+
+	    error=EEXIST;
+
+	}
+
+    }
+
+    out:
+
+    if ( error==0 ) {
+        struct fuse_entry_param e;
+
+	memset(&e, 0, sizeof(e));
+
+	if (fstat(fi->fh, &e.attr)==0) {
+    	    struct inode_struct *inode=NULL;
+
+	    inode=entry->inode;
+
+	    e.ino = inode->ino;
+	    e.attr.st_ino = e.ino;
+	    e.generation = 1;
+	    e.attr_timeout = fs_options.attr_timeout;
+	    e.entry_timeout = fs_options.entry_timeout;
+
+	    inode->mode=mode;
+
+	    inode->nlink=e.attr.st_nlink;
+	    inode->uid=e.attr.st_uid;
+	    inode->gid=e.attr.st_gid;
+	    inode->mode=e.attr.st_mode;
+
+	    inode->rdev=e.attr.st_rdev;
+	    inode->size=e.attr.st_size;
+
+	    inode->mtim.tv_sec=e.attr.st_mtim.tv_sec;
+	    inode->mtim.tv_nsec=e.attr.st_mtim.tv_nsec;
+
+	    inode->ctim.tv_sec=e.attr.st_ctim.tv_sec;
+	    inode->ctim.tv_nsec=e.attr.st_ctim.tv_nsec;
+
+    	    fuse_reply_create(req, &e, fi);
+
+	} else {
+
+	    error=errno;
+
+	    close(fi->fh); /* close it here */
+	    fi->fh=0;
+
+	    fuse_reply_err(req, error);
+
+	}
+
+    } else {
+
+	logoutput("overlayfs_create: error %i", error);
+
+	fuse_reply_err(req, error);
+
+    }
+
+}
+
+static void overlayfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+
+    if (fi->fh>0) {
+
+	close(fi->fh);
+	fi->fh=0;
+
+    }
+
+    fuse_reply_err(req, 0);
+
+}
+
+static void overlayfs_readlink(fuse_req_t req, fuse_ino_t ino)
+{
+    struct inode_struct *inode;
+    unsigned int error=0;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct call_info_struct call_info=CALL_INFO_INIT;
+
+    logoutput("READLINK");
+
+    call_info.entry=NULL;
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    inode=find_inode(ino);
+
+    if ( inode ) {
+	struct entry_struct *entry;
+
+	entry=inode->alias;
+
+	if ( entry ) {
+	    size_t size=512;
+	    char *buff=NULL;
+
+	    call_info.entry=entry;
+
+	    if (isrootentry(entry)==1) {
+
+		call_info.pathinfo.path=(char *)rootpath;
+
+	    } else {
+
+		if (get_path(&call_info, &error)==-1) goto out;
+
+	    }
+
+	    logoutput("overlayfs_readlink: path %s", call_info.pathinfo.path);
+
+	    while(size<=PATH_MAX) {
+		uid_t uid_keep;
+		gid_t gid_keep;
+		ssize_t lenread=0;
+
+		if (buff) {
+
+		    buff = realloc(buff, size);
+
+		} else {
+
+		    buff = malloc(size);
+
+		}
+
+		if ( buff ) {
+
+		    uid_keep=setfsuid(call_info.uid);
+		    gid_keep=setfsgid(call_info.gid);
+
+    		    if ((lenread=readlink(call_info.pathinfo.path, buff, size))==-1) {
+
+			error=errno;
+
+			setfsuid(uid_keep);
+			setfsgid(gid_keep);
+
+			free(buff);
+			goto out;
+
+		    }
+
+		    setfsuid(uid_keep);
+		    setfsgid(gid_keep);
+
+		    if (lenread < size) {
+
+			/* success */
+
+			buff[lenread] = '\0';
+			fuse_reply_readlink(req, buff);
+
+			logoutput("overlayfs_readlink: read link %s for %s", buff, entry->name.name);
+
+			free(buff);
+			free_path_pathinfo(&call_info.pathinfo);
+
+			return;
+
+		    }
+
+		    size+=512;
+
+		} else {
+
+		    error=ENOMEM;
+		    break;
+
+		}
+
+	    }
+
+	} else {
+
+	    error=ENOENT;
+
+	}
+
+    } else {
+
+	error=ENOENT;
+
+    }
+
+    out:
+
+    logoutput("overlayfs_readlink: error %i", error);
+
+    fuse_reply_err(req, error);
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+void remove_old_entries(struct directory_struct *directory, struct timespec *synctime)
+{
+    struct entry_struct *entry;
+
+    logoutput("remove_old_entries: synctime %li:%li", synctime->tv_sec, synctime->tv_nsec);
+
+    /* TODO: add locking */
+
+    entry=(struct entry_struct *)directory->first;
+
+    while (entry) {
+
+	if (entry->inode && entry->inode->mode==0) {
+
+	    entry=entry->name_next;
+	    continue;
+
+	}
+
+	if (entry->synctime.tv_sec<synctime->tv_sec || 
+	    (entry->synctime.tv_sec==synctime->tv_sec && entry->synctime.tv_nsec<synctime->tv_nsec)) {
+	    struct entry_struct *next=entry->name_next;
+	    unsigned int error=0;
+
+	    logoutput("remove_old_entries: remove %s synctime %li:%li", entry->name.name, entry->synctime.tv_sec, entry->synctime.tv_nsec);
+
+	    remove_entry(entry, &error);
+
+	    if (error==0) queue_remove(entry, &error);
+
+	    entry=next;
+
+	} else {
+
+	    entry=entry->name_next;
+
+	}
+
+    }
+
+}
+
+#define _FW_READDIR_MODE_FINISH				1
+#define _FW_READDIR_MODE_VIRTUAL			2
+#define _FW_READDIR_MODE_SIMPLE				4
+#define _FW_READDIR_MODE_FULL				8
+#define _FW_READDIR_MODE_NONEMPTY			16
+
+struct fw_readdir_struct {
+    struct entry_struct 				*parent;
+    struct entry_struct 				*entry;
+    struct directory_struct 				*directory;
+    off_t 						offset;
+    unsigned int 					fd;
+    unsigned char 					mode;
+    struct timespec 					synctime;
+    unsigned int 					lenpath;
+    struct readdir_struct				*readdir;
+};
+
+static inline int get_direntry(struct fw_readdir_struct *r, struct name_struct *xname, unsigned char *dtype, unsigned int *error)
+{
+
+    return (* r->readdir->get_direntry) (r->readdir, xname, dtype, error);
+}
+
+static void close_readdir(struct fw_readdir_struct *r)
+{
+    if (r->readdir) (* r->readdir->close) (r->readdir);
+}
+
+static inline struct fw_readdir_struct *get_fw_readdir(struct fuse_file_info *fi)
+{
+    return (struct fw_readdir_struct *) (uintptr_t) (fi->fh);
+}
+
+static inline void store_fw_readdir(struct fuse_file_info *fi, struct fw_readdir_struct *r)
+{
+    fi->fh = (uint64_t) (uintptr_t) r;
+}
+
+
+static void overlayfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+    struct fw_readdir_struct *fw_readdir=NULL;
+    unsigned int error=0;
+    struct entry_struct *entry;
+    struct inode_struct *inode;
+    struct call_info_struct call_info=CALL_INFO_INIT;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct directory_struct *directory=NULL;
+    int fd=-1;
+
+    logoutput("OPENDIR");
+
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    inode=find_inode(ino);
+
+    if (inode) {
+
+	entry=inode->alias;
+
+	if ( entry ) {
+	    struct statfs stfs;
+
+	    call_info.entry=entry;
+
+	    if (isrootentry(entry)==1) {
+
+		call_info.pathinfo.path=(char *)rootpath;
+
+	    } else {
+
+		if (get_path(&call_info, &error)==-1) goto error;
+
+	    }
+
+	    logoutput("overlayfs_opendir: path %s", call_info.pathinfo.path);
+
+	    fd=open(call_info.pathinfo.path, O_RDONLY | O_DIRECTORY);
+
+	    if (fd==-1) {
+
+		error=errno;
+		goto error;
+
+	    }
+
+	    if (fstatfs(fd, &stfs)==-1) {
+
+		error=errno;
+		goto error;
+
+	    }
+
+	    directory=get_directory(entry->inode, 1, &error);
+
+	    if (! directory || error>0) {
+
+		error=(error==0) ? ENOMEM : error;
+		goto error;
+
+	    }
+
+	    fw_readdir = malloc(sizeof(struct fw_readdir_struct));
+
+	    if ( ! fw_readdir ) {
+
+		error=ENOMEM;
+		goto error;
+
+	    }
+
+	    memset(fw_readdir, 0, sizeof(struct fw_readdir_struct));
+
+	    fw_readdir->parent=entry;
+	    fw_readdir->entry=NULL;
+	    fw_readdir->offset=0;
+	    fw_readdir->mode=0;
+	    fw_readdir->fd=fd;
+	    fw_readdir->lenpath=call_info.pathinfo.len;
+	    fw_readdir->readdir=NULL;
+	    fw_readdir->synctime.tv_sec=0;
+	    fw_readdir->synctime.tv_nsec=0;
+	    fw_readdir->directory=directory;
+
+	    if (directory->count>0) fw_readdir->mode |= _FW_READDIR_MODE_NONEMPTY;
+
+	    get_current_time(&fw_readdir->synctime);
+
+	    /*
+		determine the type fileystem
+		use a portable generic function here??
+	    */
+
+	    if (stfs.f_bfree==0) {
+
+		/*
+		    dealing with a system fs: use readdir
+		    and a full synchronize
+		*/
+
+		fw_readdir->readdir=init_readdir_readdir(call_info.pathinfo.path, fd, &error);
+
+		if (! fw_readdir->readdir) {
+
+		    if (error==0) error=EIO;
+		    goto error;
+
+		}
+
+		if (directory->synctime.tv_sec==0 && directory->synctime.tv_nsec==0) {
+
+		    fw_readdir->mode |= _FW_READDIR_MODE_FULL;
+
+		} else {
+
+		    fw_readdir->mode |= _FW_READDIR_MODE_SIMPLE;
+
+		}
+
+	    } else {
+
+		/*
+		    dealing with a normal fs: use getdents
+		    check the modification time of the directory and compare that with the cached directory
+		    to determine the method to synchronize
+		*/
+
+		fw_readdir->readdir=init_readdir_getdents(call_info.pathinfo.path, fd, &error);
+
+		if (! fw_readdir->readdir) {
+
+		    if (error==0) error=EIO;
+		    goto error;
+
+		}
+
+		if (directory->synctime.tv_sec==0 && directory->synctime.tv_nsec==0) {
+
+		    fw_readdir->mode |= _FW_READDIR_MODE_FULL;
+
+		} else {
+		    struct stat st;
+
+		    if (fstat(fd, &st)==-1) {
+
+			error=errno;
+			goto error;
+
+		    }
+
+		    logoutput("overlayfs_opendir: compare modifytime %li:%li with synctime %li:%li", st.st_mtim.tv_sec, st.st_mtim.tv_nsec, directory->synctime.tv_sec, directory->synctime.tv_nsec);
+
+		    if (st.st_mtim.tv_sec>directory->synctime.tv_sec || 
+			(st.st_mtim.tv_sec==directory->synctime.tv_sec && st.st_mtim.tv_nsec>directory->synctime.tv_nsec)) {
+
+			/*
+			    directory modification time is changed since last check
+			    this means entries are added or removed
+			*/
+
+			fw_readdir->mode |= _FW_READDIR_MODE_SIMPLE;
+
+		    } else {
+
+			fw_readdir->mode |= _FW_READDIR_MODE_VIRTUAL;
+			fw_readdir->entry=directory->first;
+
+		    }
+
+		}
+
+	    }
+
+	    store_fw_readdir(fi, fw_readdir);
+
+	    fuse_reply_open(req, fi);
+	    add_pathcache(&call_info.pathinfo, entry);
+	    free_path_pathinfo(&call_info.pathinfo);
+
+	    return;
+
+	} else {
+
+	    error=ENOENT;
+
+	}
+
+    } else {
+
+	error=ENOENT;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+    if (fd>0) {
+
+	close(fd);
+	fd=-1;
+
+    }
+
+    if (fw_readdir) {
+
+	if (fw_readdir->readdir) {
+
+	    if (fw_readdir->readdir->close) {
+
+		(* fw_readdir->readdir->close) (fw_readdir->readdir);
+
+	    } else {
+
+		free(fw_readdir->readdir);
+
+	    }
+
+	    fw_readdir->readdir=NULL;
+
+	}
+
+	free(fw_readdir);
+	fw_readdir=NULL;
+
+    }
+
+    logoutput("overlayfs_opendir, error %i", error);
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+static void overlayfs_readdir_virtual(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIR virtual, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct stat st;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+
+	memset(&st, 0, sizeof(struct stat));
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+		struct inode_struct *inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+        	st.st_ino = inode->ino;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotname;
+
+    	    } else if (fw_readdir->offset==1) {
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+		    struct inode_struct *inode=fw_readdir->parent->inode;
+
+	    	    st.st_ino = inode->ino;
+
+		} else {
+		    struct entry_struct *parent=fw_readdir->parent->parent;
+		    struct inode_struct *inode=parent->inode;
+
+	    	    st.st_ino=inode->ino;
+
+		}
+
+		st.st_mode = S_IFDIR;
+		name = (char *) dotdotname;
+
+    	    } else {
+
+		if (fw_readdir->entry) {
+
+		    if (fw_readdir->entry->inode && fw_readdir->entry->inode->mode>0) {
+
+			name=fw_readdir->entry->name.name;
+			st.st_mode=fw_readdir->entry->inode->mode;
+			st.st_ino=fw_readdir->entry->inode->ino;
+
+			fw_readdir->entry=fw_readdir->entry->name_next;
+
+		    } else {
+
+			/* dealing with an entry to be inserted */
+
+			fw_readdir->entry=fw_readdir->entry->name_next;
+			continue;
+
+		    }
+
+		} else {
+
+		    fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+		    break;
+
+		}
+
+	    }
+
+    	    dirent_size=fuse_add_direntry(req, buff+pos, size-pos, name, &st, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+
+	    logoutput("READDIR virtual: error unlocking directory READ");
+	}
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdir_real_simple(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIR real simple, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct stat st;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+	struct entry_struct *entry, *result;
+	struct inode_struct *inode;
+	unsigned char dtype=0;
+	struct name_struct xname={NULL, 0, 0};
+	int res=0;
+
+	memset(&st, 0, sizeof(struct stat));
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+
+		inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+        	st.st_ino = inode->ino;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotname;
+
+    	    } else if (fw_readdir->offset==1) {
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+
+		    inode=fw_readdir->parent->inode;
+
+	    	    st.st_ino = inode->ino;
+
+		} else {
+		    struct entry_struct *parent=fw_readdir->parent->parent;
+
+		    inode=parent->inode;
+
+	    	    st.st_ino=inode->ino;
+
+		}
+
+		st.st_mode = S_IFDIR;
+		name = (char *) dotdotname;
+
+    	    } else {
+
+		if (! fw_readdir->entry) {
+
+		    readdir:
+
+		    res=get_direntry(fw_readdir, &xname, &dtype, &error);
+
+		    if (res<=0) {
+
+			if (res==-1) {
+
+			    free(buff);
+			    unlock_directory(directory, _DIRECTORY_LOCK_EXCL);
+			    goto error;
+
+			}
+
+			fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+			break;
+
+		    }
+
+		    xname.len=strlen(xname.name);
+		    calculate_nameindex(&xname);
+
+		    error=0;
+
+		    entry=create_entry(fw_readdir->parent, &xname);
+		    inode=create_inode();
+
+		    if (entry && inode) {
+
+			result=insert_entry_batch(directory, entry, &error, 0);
+
+			if (result==entry) {
+
+			    entry->inode->mode=DTTOIF(dtype);
+
+			    assign_ino(inode);
+			    add_inode_hashtable(inode);
+
+			    inode->alias=entry;
+			    entry->inode=inode;
+
+			    adjust_pathmax(fw_readdir->lenpath + 1 + xname.len);
+
+			} else {
+
+			    if (error==EEXIST) {
+
+				destroy_entry(entry);
+				entry=result;
+
+				free(inode);
+				inode=entry->inode;
+
+			    } else {
+
+				free(buff);
+				destroy_entry(entry);
+				free(inode);
+
+				goto error;
+
+			    }
+
+			}
+
+			st.st_mode=entry->inode->mode;
+			st.st_ino=entry->inode->ino;
+			name=entry->name.name;
+
+		    } else {
+
+			if (entry) {
+
+			    destroy_entry(entry);
+			    entry=NULL;
+
+			}
+
+			if (inode) {
+
+			    free(inode);
+			    inode=NULL;
+
+			}
+
+			error=ENOMEM;
+			free(buff);
+
+			goto error;
+
+		    }
+
+		    fw_readdir->entry=entry;
+
+		} else {
+
+		    st.st_ino=fw_readdir->entry->inode->ino;
+		    st.st_mode=fw_readdir->entry->inode->mode;
+		    name=fw_readdir->entry->name.name;
+
+		}
+
+	    }
+
+    	    dirent_size=fuse_add_direntry(req, buff+pos, size-pos, name, &st, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->entry=NULL; /* forget current entry to force readdir */
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+        }
+
+	unlock_directory(directory, _DIRECTORY_LOCK_EXCL);
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdir_real_full(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIR real full, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct stat st;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+	struct entry_struct *entry, *result;
+	struct inode_struct *inode;
+	unsigned int row=0;
+	unsigned char dtype=0;
+	struct name_struct xname={NULL, 0, 0};
+	int res;
+
+	memset(&st, 0, sizeof(struct stat));
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+
+		inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+        	st.st_ino = inode->ino;
+		st.st_mode = S_IFDIR;
+		name = (char *) dotname;
+
+    	    } else if (fw_readdir->offset==1) {
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+
+		    inode=fw_readdir->parent->inode;
+	    	    st.st_ino = inode->ino;
+
+		} else {
+		    struct entry_struct *parent=fw_readdir->parent->parent;
+
+		    inode=parent->inode;
+	    	    st.st_ino=inode->ino;
+
+		}
+
+		st.st_mode = S_IFDIR;
+		name = (char *) dotdotname;
+
+    	    } else {
+
+		if (! fw_readdir->entry) {
+
+		    readdir:
+
+		    res=get_direntry(fw_readdir, &xname, &dtype, &error);
+
+		    if (res<=0) {
+
+			if (res==-1) {
+
+			    free(buff);
+			    unlock_directory(directory, _DIRECTORY_LOCK_EXCL);
+			    goto error;
+
+			}
+
+			fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+			break;
+
+		    }
+
+		    xname.len=strlen(xname.name);
+		    calculate_nameindex(&xname);
+
+		    error=0;
+
+		    entry=create_entry(fw_readdir->parent, &xname);
+		    inode=create_inode();
+
+		    if (entry && inode) {
+
+			result=insert_entry_batch(directory, entry, &error, 0);
+
+			if (result==entry) {
+
+			    entry->inode->mode=DTTOIF(dtype);
+
+			    assign_ino(inode);
+			    add_inode_hashtable(inode);
+
+			    inode->alias=entry;
+			    entry->inode=inode;
+
+			    adjust_pathmax(fw_readdir->lenpath + 1 + xname.len);
+
+			} else {
+
+			    if (error==EEXIST) {
+
+				destroy_entry(entry);
+				entry=result;
+
+				free(inode);
+				inode=entry->inode;
+
+			    } else {
+
+				free(buff);
+				destroy_entry(entry);
+				free(inode);
+
+				goto error;
+
+			    }
+
+			}
+
+			st.st_mode=entry->inode->mode;
+			st.st_ino=entry->inode->ino;
+			name=entry->name.name;
+
+		    } else {
+
+			if (entry) {
+
+			    destroy_entry(entry);
+			    entry=NULL;
+
+			}
+
+			if (inode) {
+
+			    free(inode);
+			    inode=NULL;
+
+			}
+
+			error=ENOMEM;
+			free(buff);
+
+			goto error;
+
+		    }
+
+		    fw_readdir->entry=entry;
+
+		} else {
+
+		    st.st_ino=fw_readdir->entry->inode->ino;
+		    st.st_mode=fw_readdir->entry->inode->mode;
+		    name=fw_readdir->entry->name.name;
+
+		}
+
+	    }
+
+    	    dirent_size=fuse_add_direntry(req, buff+pos, size-pos, name, &st, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->entry=NULL; /* forget current entry to force readdir */
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+        }
+
+	if (unlock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    logoutput("READDIR real full: error unlocking directory EXL");
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdirplus_virtual(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIRPLUS virtual, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct fuse_entry_param e;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+
+	memset(&e, 0, sizeof(struct fuse_entry_param));
+
+	e.generation = 1;
+	e.attr_timeout = fs_options.attr_timeout;
+	e.entry_timeout = fs_options.entry_timeout;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+		struct inode_struct *inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotname;
+
+		inode->nlookup++;
+
+    	    } else if (fw_readdir->offset==1) {
+    		struct inode_struct *inode=NULL;
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+
+		    inode=fw_readdir->parent->inode;
+
+		} else {
+
+		    inode=fw_readdir->parent->parent->inode;
+
+		}
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotdotname;
+
+		inode->nlookup++;
+
+    	    } else {
+
+		if (fw_readdir->entry) {
+		    struct inode_struct *inode=fw_readdir->entry->inode;
+
+		    if (inode->mode==0) {
+
+			fw_readdir->entry=fw_readdir->entry->name_next;
+			continue;
+
+		    }
+
+		    e.ino = inode->ino;
+
+		    e.attr.st_ino = e.ino;
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    name=fw_readdir->entry->name.name;
+
+		    inode->nlookup++;
+
+		    fw_readdir->entry=fw_readdir->entry->name_next;
+
+		} else {
+
+		    fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+		    break;
+
+		}
+
+	    }
+
+    	    dirent_size=fuse_add_direntry_plus(req, buff+pos, size-pos, name, &e, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+	}
+
+	if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+
+	    logoutput("READDIR virtual: error unlocking directory READ");
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdirplus_real_simple(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIRPLUS real simple, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct fuse_entry_param e;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+	struct entry_struct *entry;
+	struct inode_struct *inode;
+	unsigned int row=0;
+	unsigned char dtype;
+	struct name_struct xname={NULL, 0, 0};
+	int res=0;
+
+	memset(&e, 0, sizeof(struct fuse_entry_param));
+
+	e.generation = 1;
+	e.attr_timeout = fs_options.attr_timeout;
+	e.entry_timeout = fs_options.entry_timeout;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+
+		inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotname;
+
+		inode->nlookup++;
+
+    	    } else if (fw_readdir->offset==1) {
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+
+		    inode=fw_readdir->parent->inode;
+
+		} else {
+
+		    inode=fw_readdir->parent->parent->inode;
+
+		}
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotdotname;
+
+		inode->nlookup++;
+
+    	    } else {
+
+		if (! fw_readdir->entry) {
+
+		    readdir:
+
+		    res=get_direntry(fw_readdir, &xname, &dtype, &error);
+
+		    if (res<=0) {
+
+			if (res==-1) {
+
+			    free(buff);
+			    unlock_directory(directory, _DIRECTORY_LOCK_EXCL);
+			    goto error;
+
+			}
+
+			fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+			break;
+
+		    }
+
+		    if (fstatat(fw_readdir->fd, xname.name, &e.attr, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT)==-1) {
+
+			goto readdir;
+
+		    }
+
+		    logoutput("overlayfs_readdirplus_real_simple: read %s", xname.name);
+
+		    xname.len=strlen(xname.name);
+		    calculate_nameindex(&xname);
+
+		    error=0;
+
+		    entry=find_entry_batch(directory, &xname, &error);
+
+		    if (! entry) {
+
+			entry=create_entry(fw_readdir->parent, &xname);
+			inode=create_inode();
+
+			if (entry && inode) {
+
+			    assign_ino(inode);
+			    add_inode_hashtable(inode);
+
+			    insert_entry_batch(directory, entry, &error, 0);
+
+			    inode=entry->inode;
+
+			    memcpy(&entry->synctime, &fw_readdir->synctime, sizeof(struct timespec));
+
+			    inode->nlookup++;
+			    adjust_pathmax(fw_readdir->lenpath + 1 + xname.len);
+
+			} else {
+
+			    error=ENOMEM;
+			    free(buff);
+
+			    goto error;
+
+			}
+
+		    } else {
+
+			inode=entry->inode;
+			memcpy(&entry->synctime, &fw_readdir->synctime, sizeof(struct timespec));
+
+			inode->nlookup++;
+
+		    }
+
+		    name=entry->name.name;
+		    fw_readdir->entry=entry;
+
+		    inode->mode = e.attr.st_mode;
+		    inode->nlink = e.attr.st_nlink;
+		    inode->uid = e.attr.st_uid;
+		    inode->gid = e.attr.st_gid;
+		    inode->rdev = e.attr.st_rdev;
+
+		    inode->mtim.tv_sec = e.attr.st_mtim.tv_sec;
+		    inode->mtim.tv_nsec = e.attr.st_mtim.tv_nsec;
+		    inode->ctim.tv_sec = e.attr.st_ctim.tv_sec;
+		    inode->ctim.tv_nsec = e.attr.st_ctim.tv_nsec;
+
+		    if (S_ISDIR(e.attr.st_mode)) {
+
+			e.attr.st_size=0;
+
+		    } else {
+
+			inode->size=e.attr.st_size;
+
+		    }
+
+		} else {
+
+		    inode=fw_readdir->entry->inode;
+		    name=fw_readdir->entry->name.name;
+
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    inode->nlookup++;
+
+		}
+
+		e.ino = inode->ino;
+		e.attr.st_ino = e.ino;
+
+	    }
+
+    	    dirent_size=fuse_add_direntry_plus(req, buff+pos, size-pos, name, &e, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->entry=NULL; /* forget current entry to force readdir */
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+        }
+
+	if (unlock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    logoutput("READDIR virtual: error unlocking directory EXL");
+
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdirplus_real_full(fuse_req_t req, size_t size, off_t offset, struct fw_readdir_struct *fw_readdir)
+{
+    unsigned int error=0;
+
+    logoutput("READDIRPLUS real full, size: %zi", size);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+
+	return;
+
+    } else {
+	char *buff=NULL;
+	size_t pos=0;
+	size_t dirent_size;
+	struct fuse_entry_param e;
+	char *name=NULL;
+	struct directory_struct *directory=fw_readdir->directory;
+	struct entry_struct *entry, *result;
+	struct inode_struct *inode;
+	unsigned int row=0;
+	unsigned char dtype;
+	struct name_struct xname={NULL, 0, 0};
+	int res=0;
+
+	memset(&e, 0, sizeof(struct fuse_entry_param));
+
+	e.generation = 1;
+	e.attr_timeout = fs_options.attr_timeout;
+	e.entry_timeout = fs_options.entry_timeout;
+
+	e.attr.st_blksize=4096;
+	e.attr.st_blocks=0;
+
+	buff=malloc(size);
+
+	if (! buff) {
+
+	    error=ENOMEM;
+	    goto error;
+
+	}
+
+	if (lock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    free(buff);
+	    buff=NULL;
+	    error=EAGAIN;
+	    goto error;
+
+	}
+
+	while (pos<size) {
+
+    	    if (fw_readdir->offset==0) {
+
+		inode=fw_readdir->parent->inode;
+
+        	/* the . entry */
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotname;
+
+		inode->nlookup++;
+
+    	    } else if (fw_readdir->offset==1) {
+
+        	/* the .. entry */
+
+		if (isrootentry(fw_readdir->parent)==1 ) {
+
+		    inode=fw_readdir->parent->inode;
+
+		} else {
+
+		    inode=fw_readdir->parent->parent->inode;
+
+		}
+
+		e.ino = inode->ino;
+
+		e.attr.st_ino = e.ino;
+		e.attr.st_mode = inode->mode;
+		e.attr.st_nlink = inode->nlink;
+		e.attr.st_uid = inode->uid;
+		e.attr.st_gid = inode->gid;
+		e.attr.st_rdev = inode->rdev;
+		e.attr.st_size = 0;
+		e.attr.st_atim.tv_sec = 0;
+		e.attr.st_atim.tv_nsec = 0;
+		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		name = (char *) dotdotname;
+
+		inode->nlookup++;
+
+    	    } else {
+
+		if (! fw_readdir->entry) {
+
+		    readdir:
+
+		    res=get_direntry(fw_readdir, &xname, &dtype, &error);
+
+		    if (res<=0) {
+
+			if (res==-1) {
+
+			    free(buff);
+			    unlock_directory(directory, _DIRECTORY_LOCK_EXCL);
+			    goto error;
+
+			}
+
+			fw_readdir->mode |= _FW_READDIR_MODE_FINISH;
+			break;
+
+		    }
+
+		    if (fstatat(fw_readdir->fd, xname.name, &e.attr, AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT)==-1) {
+
+			goto readdir;
+
+		    }
+
+		    logoutput("overlayfs_readdirplus_real_full: read %s", xname.name);
+
+		    xname.len=strlen(xname.name);
+		    calculate_nameindex(&xname);
+
+		    error=0;
+
+		    entry=create_entry(fw_readdir->parent, &xname);
+		    inode=create_inode();
+
+		    if (entry && inode) {
+
+			result=insert_entry_batch(directory, entry, &error, 0);
+
+			if (result==entry) {
+
+			    memcpy(&entry->synctime, &fw_readdir->synctime, sizeof(struct timespec));
+			    inode->mode=DTTOIF(dtype);
+
+			    assign_ino(inode);
+			    add_inode_hashtable(inode);
+
+			    inode->alias=entry;
+			    entry->inode=inode;
+
+			    adjust_pathmax(fw_readdir->lenpath + 1 + xname.len);
+
+			} else {
+
+			    if (error==EEXIST) {
+
+				destroy_entry(entry);
+				entry=result;
+
+				memcpy(&entry->synctime, &fw_readdir->synctime, sizeof(struct timespec));
+
+				free(inode);
+				inode=entry->inode;
+
+			    } else {
+
+				free(buff);
+				destroy_entry(entry);
+				free(inode);
+
+				goto error;
+
+			    }
+
+			}
+
+			e.attr.st_ino=inode->ino;
+			e.ino=inode->ino;
+			e.attr.st_rdev = inode->rdev;
+			e.attr.st_dev = 0;
+			name=entry->name.name;
+
+		    } else {
+
+			if (entry) {
+
+			    destroy_entry(entry);
+			    entry=NULL;
+
+			}
+
+			if (inode) {
+
+			    free(inode);
+			    inode=NULL;
+
+			}
+
+			error=ENOMEM;
+			free(buff);
+
+			goto error;
+
+		    }
+
+		    name=entry->name.name;
+		    fw_readdir->entry=entry;
+
+		    inode->mode = e.attr.st_mode;
+		    inode->nlink = e.attr.st_nlink;
+		    inode->uid = e.attr.st_uid;
+		    inode->gid = e.attr.st_gid;
+		    inode->rdev = e.attr.st_rdev;
+
+		    inode->mtim.tv_sec = e.attr.st_mtim.tv_sec;
+		    inode->mtim.tv_nsec = e.attr.st_mtim.tv_nsec;
+		    inode->ctim.tv_sec = e.attr.st_ctim.tv_sec;
+		    inode->ctim.tv_nsec = e.attr.st_ctim.tv_nsec;
+
+		    if (S_ISDIR(e.attr.st_mode)) {
+
+			e.attr.st_size=0;
+
+		    } else {
+
+			inode->size=e.attr.st_size;
+
+		    }
+
+		} else {
+
+		    inode=fw_readdir->entry->inode;
+		    name=fw_readdir->entry->name.name;
+
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    inode->nlookup++;
+
+		}
+
+		e.ino = inode->ino;
+		e.attr.st_ino = e.ino;
+
+	    }
+
+    	    dirent_size=fuse_add_direntry_plus(req, buff+pos, size-pos, name, &e, fw_readdir->offset+1);
+
+	    if (pos + dirent_size > size) {
+
+		break;
+
+	    }
+
+	    /* increase counter and clear the various fields */
+
+	    fw_readdir->entry=NULL; /* forget current entry to force readdir */
+	    fw_readdir->offset++;
+	    pos += dirent_size;
+
+        }
+
+	if (unlock_directory(directory, _DIRECTORY_LOCK_EXCL)==-1) {
+
+	    logoutput("READDIRPLUS real plus: error unlocking directory EXCL");
+	}
+
+	fuse_reply_buf(req, buff, pos);
+
+	free(buff);
+	buff=NULL;
+
+	return;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+}
+
+static void overlayfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    struct fw_readdir_struct *fw_readdir=get_fw_readdir(fi);
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
+
+	overlayfs_readdir_virtual(req, size, offset, fw_readdir);
+
+    } else if (fw_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
+
+	overlayfs_readdir_real_simple(req, size, offset, fw_readdir);
+
+    } else if (fw_readdir->mode & _FW_READDIR_MODE_FULL) {
+
+	overlayfs_readdir_real_full(req, size, offset, fw_readdir);
+
+    }
+
+}
+
+static void overlayfs_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    struct fw_readdir_struct *fw_readdir=(struct fw_readdir_struct *) (uintptr_t) fi->fh;
+
+    if (fw_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
+
+	overlayfs_readdirplus_virtual(req, size, offset, fw_readdir);
+
+    } else if (fw_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
+
+	overlayfs_readdirplus_real_simple(req, size, offset, fw_readdir);
+
+    } else if (fw_readdir->mode & _FW_READDIR_MODE_FULL) {
+
+	overlayfs_readdirplus_real_full(req, size, offset, fw_readdir);
+
+    }
+
+}
+
+static void overlayfs_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+    struct fw_readdir_struct *fw_readdir=get_fw_readdir(fi);
+    struct directory_struct *directory=NULL;
+    struct timespec synctime;
+    unsigned int error=0;
+    unsigned int mode=0;
+
+    (void) ino;
+
+    logoutput("RELEASEDIR");
+
+    if (fw_readdir) {
+
+	directory=fw_readdir->directory;
+
+	mode=fw_readdir->mode;
+
+	directory->synctime.tv_sec=fw_readdir->synctime.tv_sec;
+	directory->synctime.tv_nsec=fw_readdir->synctime.tv_nsec;
+
+	synctime.tv_sec=fw_readdir->synctime.tv_sec;
+	synctime.tv_nsec=fw_readdir->synctime.tv_nsec;
+
+	close_readdir(fw_readdir);
+
+	if (fw_readdir->fd>0) {
+
+	    close(fw_readdir->fd);
+	    fw_readdir->fd=0;
+
+	}
+
+	free(fw_readdir);
+	fw_readdir=NULL;
+
+    }
+
+    fuse_reply_err(req, 0);
+    fi->fh=0;
+
+    if (directory) {
+
+	/* when synced with backend and there were entries at start test these are not synced */
+
+	if (mode & _FW_READDIR_MODE_NONEMPTY & (_FW_READDIR_MODE_SIMPLE | _FW_READDIR_MODE_FULL)) remove_old_entries(directory, &synctime);
+
+	directory->synctime.tv_sec=synctime.tv_sec;
+	directory->synctime.tv_nsec=synctime.tv_nsec;
+
+    }
+
+    clean_pathcache();
+
+}
+
+static void overlayfs_statfs(fuse_req_t req, fuse_ino_t ino)
+{
+    struct statvfs st;
+    unsigned int error=0;
+    struct entry_struct *entry; 
+    struct inode_struct *inode;
+
+    logoutput("STATFS");
+
+    inode=find_inode(ino);
+
+    if ( ! inode ) {
+
+	error=ENOENT;
+	goto error;
+
+    }
+
+    entry=inode->alias;
+
+    if ( ! entry ){
+
+	error=ENOENT;
+	goto error;
+
+    }
+
+    memset(&st, 0, sizeof(statvfs));
+
+    /* should the statvfs be taken of the path or the root ?? */
+
+    if (statvfs("/", &st)==0) {
+
+	// take some values from the default
+
+	/* note the fs does not provide opening/reading/writing of files, so info about blocksize etc
+	   is useless, so do not override the default from the root */ 
+
+	st.f_bsize=4096; /* good?? */
+	st.f_frsize=st.f_bsize; /* no fragmentation on this fs */
+	st.f_blocks=0;
+
+	st.f_bfree=0;
+	st.f_bavail=0;
+
+	st.f_files=get_nrinodes();
+	st.f_ffree=UINT64_MAX - st.f_files ; /* inodes are of unsigned long int, 4 bytes:32 */
+	st.f_favail=st.f_ffree;
+
+	// do not know what to put here... just some default values... no fsid.... just zero
+
+	st.f_fsid=0;
+	st.f_flag=0;
+	st.f_namemax=255;
+
+	fuse_reply_statfs(req, &st);
+
+	return;
+
+    } else {
+
+	error=errno;
+
+    }
+
+    error:
+
+    fuse_reply_err(req, error);
+
+    logoutput("statfs error: %i", error);
+
+}
+
+static void overlayfs_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
+{
+    unsigned int error=0;
+    struct entry_struct *entry;
+    struct inode_struct *inode;
+    struct call_info_struct call_info=CALL_INFO_INIT;
+    const struct fuse_ctx *ctx=fuse_req_ctx(req);
+    struct notifywatch_struct *watch=NULL;
+
+    logoutput("FSNOTIFY");
+
+    call_info.pid=ctx->pid;
+    call_info.uid=ctx->uid;
+    call_info.gid=ctx->gid;
+    call_info.umask=ctx->umask;
+
+    call_info.pathinfo.path=NULL;
+    call_info.pathinfo.len=0;
+    call_info.pathinfo.flags=0;
+
+    inode=find_inode(ino);
+
+    if ( ! inode ) {
+
+	error=ENOENT;
+	goto out;
+
+    }
+
+    entry=inode->alias;
+
+    if ( ! entry ){
+
+	error=ENOENT;
+	goto out;
+
+    }
+
+    call_info.entry=entry;
+
+    if (isrootentry(entry)==1) {
+
+	call_info.pathinfo.path = (char *)rootpath;
+	call_info.pathinfo.flags = PATHINFOFLAGS_INUSE;
+	call_info.pathinfo.len = strlen(rootpath);
+
+    } else {
+
+	if (get_path(&call_info, &error)==-1) goto out;
+
+    }
+
+    logoutput("overlayfs_fsnotify: on %s mask %i", call_info.pathinfo.path, mask);
+
+    watch=lookup_watch_inode(inode);
+
+    if (watch) {
+
+	if (!(mask==watch->mask)) change_notifywatch(watch, mask);
+
+    } else if (mask>0) {
+
+	watch=add_notifywatch(inode, mask, &call_info.pathinfo, &error);
+
+    }
+
+    out:
+
+    free_path_pathinfo(&call_info.pathinfo);
+
+}
+
+static void overlayfs_init (void *userdata, struct fuse_conn_info *conn)
+{
+
+    logoutput("INIT");
+
+}
+
+static void overlayfs_destroy (void *userdata)
+{
+
+    logoutput("DESTROY");
+
+
+}
+
+static void overlayfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
+{
+    struct inode_struct *inode;
+
+    logoutput("GETXATTR, name %s", name);
+
+    if (strcmp(name, "system.posix_acl_access")==0 || strcmp(name, "system.posix_acl_default")==0) goto out;
+
+    inode=find_inode(ino);
+
+    if ( inode ) {
+	struct entry_struct *entry=NULL;
+
+	entry=inode->alias;
+
+	if ( entry ) {
+
+	    if (isrootentry(entry)==1) {
+
+		if (strcmp(name, "pathmax")==0) {
+
+		    if (size==0) {
+			size_t count=0;
+
+			/* pathmax */
+
+			count+=log10(get_pathmax()) + 2;
+
+			fuse_reply_xattr(req, count);
+
+		    } else {
+			size_t count=0;
+
+			/* pathmax */
+
+			count+=log10(get_pathmax()) + 2;
+
+			if (count<size) {
+			    char *buff=NULL;
+			    char result[count];
+
+			    buff=malloc(size);
+
+			    if (buff) {
+
+				sprintf(result, "%i", (int) get_pathmax());
+
+				memset(buff, 0, size);
+				memcpy(buff, result, count);
+
+				logoutput("overlayfs_getxattr: reply buff %s", buff);
+
+				fuse_reply_buf(req, buff, size);
+
+				free(buff);
+
+			    } else {
+
+				fuse_reply_err(req, ENOMEM);
+
+			    }
+
+			} else {
+
+			    fuse_reply_err(req, ERANGE);
+
+			}
+
+		    }
+
+		    return;
+
+		}
+
+	    }
+
+	}
+
+    }
+
+    out:
+
+    fuse_reply_err(req, ENOATTR);
+
+}
+
+static void overlayfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+    struct inode_struct *inode;
+
+    logoutput("LISTXATTR");
+
+    inode=find_inode(ino);
+
+    if ( inode ) {
+	struct entry_struct *entry=NULL;
+
+	entry=inode->alias;
+
+	if ( entry ) {
+
+	    if (isrootentry(entry)==1) {
+
+		if (size==0) {
+		    size_t count=0;
+
+		    /* pathmax */
+
+		    count+=strlen("pathmax") + 2;
+
+		    fuse_reply_xattr(req, count);
+
+		} else {
+		    size_t count=0;
+
+		    /* pathmax */
+
+		    count+=strlen("pathmax") + 2;
+
+		    if (count<=size) {
+			char *buff=NULL;
+			char result[count];
+
+			buff=malloc(size);
+
+			if (buff) {
+			    int len=0;
+
+			    len=sprintf(result, "%i", (int) get_pathmax());
+
+			    memset(buff, '\0', size);
+			    memcpy(buff, result, count);
+
+			    logoutput("overlayfs_listxattr: reply buff %s", buff);
+
+			    fuse_reply_buf(req, buff, size);
+
+			    free(buff);
+
+			} else {
+
+			    fuse_reply_err(req, ENOMEM);
+
+			}
+
+		    } else {
+
+			fuse_reply_err(req, ERANGE);
+
+		    }
+
+		}
+
+		return;
+
+	    }
+
+	}
+
+    }
+
+    if (size==0) {
+
+	fuse_reply_xattr(req, 0);
+
+    } else {
+
+	fuse_reply_buf(req, NULL, 0);
+
+    }
+
+}
+

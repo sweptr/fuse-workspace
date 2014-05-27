@@ -29,22 +29,6 @@
 #define HAVE_SETXATTR
 #endif
 
-#define MODEMASK 07777
-
-
-#ifndef FUSE_SET_ATTR_ATIME_NOW
-#define FUSE_SET_ATTR_ATIME_NOW (1 << 7)
-#endif
-
-#ifndef FUSE_SET_ATTR_MTIME_NOW
-#define FUSE_SET_ATTR_MTIME_NOW (1 << 8)
-#endif
-
-#ifndef SIZE_INODE_HASHTABLE
-#define SIZE_INODE_HASHTABLE 32768
-#endif
-
 #define LOGGING
-#define LOG_DEFAULT_LEVEL	1
 
 

@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <sys/param.h>
 #include <pthread.h>
+#include <sys/inotify.h>
 
 #ifndef ENOATTR
 #define ENOATTR ENODATA        /* No such attribute */
@@ -42,23 +43,23 @@
 
 #define WATCHES_TABLESIZE          1024
 
+#include "fuse-workspace.h"
+
 #include "workerthreads.h"
 #include "beventloop-utils.h"
 
 #include "entry-management.h"
 
-#include "skiplist.h"
-#include "skiplist-utils.h"
-#include "skiplist-delete.h"
-#include "skiplist-find.h"
-#include "skiplist-insert.h"
-
 #include "path-resolution.h"
 #include "options.h"
-#include "fschangenotify.h"
 #include "utils.h"
 #include "simple-list.h"
-#include "handlefuseevent.h"
+#include "workspaces.h"
+#include "objects.h"
+
+#include "fschangenotify.h"
+#include "fschangenotify-event.h"
+
 
 #ifdef LOGGING
 
@@ -93,13 +94,19 @@ static inline void dummy_nolog()
 
 #endif
 
-extern struct overlayfs_options_struct overlayfs_options;
+extern struct fs_options_struct fs_options;
+extern struct workerthreads_queue_struct workerthreads_queue;
 
-unsigned long watchctr = 1;
-pthread_mutex_t watchctr_mutex=PTHREAD_MUTEX_INITIALIZER;
+struct systemwatches_struct {
+    struct notifywatch_struct 	*first;
+    pthread_mutex_t		mutex;
+};
 
 static struct simple_group_struct group_watches_inode;
-static struct simple_group_struct group_watches_ctr;
+static struct systemwatches_struct systemwatches = { NULL, PTHREAD_MUTEX_INITIALIZER};
+
+static struct watchbackend_struct os_watchbackend = {0, NULL, NULL, NULL};
+extern struct watchbackend_struct fssync_watchbackend;
 
 #ifdef __gnu_linux__
 
@@ -127,6 +134,7 @@ void remove_watch_backend_os_specific(struct notifywatch_struct *watch)
 void initialize_fsnotify_backend(unsigned int *error)
 {
     initialize_inotify(error);
+
 }
 
 void close_fsnotify_backend()
@@ -182,21 +190,21 @@ void unlock_watch(struct notifywatch_struct *watch)
     function to lookup a watch using the inode
 */
 
-static unsigned int calculate_inode_hash(struct inode_struct *inode)
+static unsigned int calculate_inode_hash_watch(struct inode_struct *inode)
 {
     return inode->ino % group_watches_inode.len;
 }
 
-static int inode_hashfunction(void *data)
+static int watch_inode_hashfunction(void *data)
 {
     struct notifywatch_struct *watch=(struct notifywatch_struct *) data;
-    if (watch->inode) return calculate_inode_hash(watch->inode);
+    if (watch->inode) return calculate_inode_hash_watch(watch->inode);
     return 0;
 }
 
 struct notifywatch_struct *lookup_watch_inode(struct inode_struct *inode)
 {
-    unsigned int hashvalue=calculate_inode_hash(inode);
+    unsigned int hashvalue=calculate_inode_hash_watch(inode);
     void *index=NULL;
     struct notifywatch_struct *watch=NULL;
 
@@ -224,59 +232,74 @@ void remove_watch_inodetable(struct notifywatch_struct *watch)
 }
 
 /*
-    functions to lookup the watch using the (unique) ctr
+    maintain a list of system watches
 */
 
-static unsigned int calculate_ctr_hash(unsigned int ctr)
+void add_watch_systemwatches(struct notifywatch_struct *watch)
 {
-    return ctr % group_watches_ctr.len;
+
+    pthread_mutex_lock(&systemwatches.mutex);
+
+    watch->prev=NULL;
+    watch->next=systemwatches.first;
+
+    systemwatches.first=watch;
+
+    pthread_mutex_unlock(&systemwatches.mutex);
+
 }
 
-static int ctr_hashfunction(void *data)
+void remove_watch_systemwatches(struct notifywatch_struct *watch)
 {
-    struct notifywatch_struct *watch=(struct notifywatch_struct *) data;
-    return calculate_ctr_hash(watch->ctr);
+
+    pthread_mutex_lock(&systemwatches.mutex);
+
+    if (systemwatches.first==watch) {
+
+	systemwatches.first=watch->next;
+
+	if (systemwatches.first) systemwatches.first->prev=NULL;
+
+    } else {
+
+	if (watch->prev) watch->prev->next=watch->next;
+	if (watch->next) watch->next->prev=watch->prev;
+
+    }
+
+    pthread_mutex_unlock(&systemwatches.mutex);
+
 }
 
-struct notifywatch_struct *lookup_watch_ctr(unsigned int ctr)
+struct notifywatch_struct *lookup_watch_systemwatches(struct pathinfo_struct *pathinfo)
 {
-    unsigned int hashvalue=calculate_ctr_hash(ctr);
-    void *index=NULL;
     struct notifywatch_struct *watch=NULL;
 
-    watch=(struct notifywatch_struct *) get_next_element(&group_watches_ctr, &index, hashvalue);
+    pthread_mutex_lock(&systemwatches.mutex);
+
+    watch=systemwatches.first;
 
     while(watch) {
 
-	if (watch->ctr==ctr) break;
-	watch=(struct notifywatch_struct *) get_next_element(&group_watches_ctr, &index, hashvalue);
+	if (strcmp(pathinfo->path, watch->pathinfo.path)==0) break;
+
+	watch=watch->next;
 
     }
+
+    pthread_mutex_unlock(&systemwatches.mutex);
 
     return watch;
 
 }
 
-void add_watch_ctrtable(struct notifywatch_struct *watch)
-{
-    add_element_to_group(&group_watches_ctr, (void *) watch);
-}
-
-void remove_watch_ctrtable(struct notifywatch_struct *watch)
-{
-    remove_element_from_group(&group_watches_ctr, (void *) watch);
-}
 
 int init_watch_hashtables()
 {
     int result=0;
     unsigned int error=0;
 
-    result=initialize_group(&group_watches_inode, inode_hashfunction, 256, &error);
-
-    if (result<0) goto out;
-
-    result=initialize_group(&group_watches_ctr, ctr_hashfunction, 256, &error);
+    result=initialize_group(&group_watches_inode, watch_inode_hashfunction, 256, &error);
 
     out:
 
@@ -284,43 +307,184 @@ int init_watch_hashtables()
 
 }
 
-struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t mask, struct pathinfo_struct *pathinfo)
+/*
+    function to determine the fsnotify mask by comparing the backend (real value) (st) with the cache (inode)
+*/
+
+uint32_t determine_fsnotify_mask(struct inode_struct *inode, struct stat *st)
 {
-    struct notifywatch_struct *watch=NULL;
-    unsigned char watchcreated=0;
-    int result=0;
+    uint32_t fsnotify_mask=0;
 
-    watch=lookup_watch_inode(inode);
+    if (inode->mode != st->st_mode) {
 
-    if (pathinfo->path) {
-
-	/* possible here compare the pathinfo->path with the one stored in watch->pathinfo.path*/
-
-	logoutput("add_watch: on %s mask %i", pathinfo->path, (int) mask);
-
-    } else {
-
-	if (! watch) {
-
-	    logoutput("add_watch: on UNKNOWN path, path is required");
-	    goto out;
-
-	}
+	fsnotify_mask |= IN_ATTRIB;
+	inode->mode = st->st_mode;
 
     }
 
+    if (inode->uid != st->st_uid) {
+
+	fsnotify_mask |= IN_ATTRIB;
+	inode->uid = st->st_uid;
+
+    }
+
+    if (inode->gid != st->st_gid) {
+
+	fsnotify_mask |= IN_ATTRIB;
+	inode->gid = st->st_gid;
+
+    }
+
+    if (inode->mtim.tv_sec != st->st_mtim.tv_sec || inode->mtim.tv_nsec != st->st_mtim.tv_nsec) {
+
+	fsnotify_mask |= IN_MODIFY;
+	inode->mtim.tv_sec = st->st_mtim.tv_sec;
+	inode->mtim.tv_nsec = st->st_mtim.tv_nsec;
+
+    }
+
+    if (inode->ctim.tv_sec != st->st_ctim.tv_sec || inode->ctim.tv_nsec != st->st_ctim.tv_nsec) {
+
+	/* action ? */
+
+	inode->ctim.tv_sec = st->st_ctim.tv_sec;
+	inode->ctim.tv_nsec = st->st_ctim.tv_nsec;
+
+    }
+
+    return fsnotify_mask;
+
+}
+
+static struct notifywatch_struct *lookup_watch_inodetable_bypath(char *path)
+{
+    unsigned int hashvalue=0;
+    void *index=NULL;
+    struct notifywatch_struct *watch=NULL;
+
+    while (hashvalue<group_watches_inode.len) {
+
+	index=NULL;
+
+	watch=(struct notifywatch_struct *) get_next_element(&group_watches_inode, &index, hashvalue);
+
+	while(watch) {
+
+	    if (strcmp(watch->pathinfo.path, path)==0) break;
+
+	    watch=(struct notifywatch_struct *) get_next_element(&group_watches_inode, &index, hashvalue);
+
+	}
+
+	hashvalue++;
+
+    }
+
+    return watch;
+
+}
+
+uint32_t get_cbmask(struct watchcb_struct *cb) {
+
+    uint32_t mask=0;
+
+    if (cb->create) mask |= (IN_CREATE | IN_MOVED_TO);
+    if (cb->remove) mask |= (IN_DELETE | IN_MOVED_FROM);
+    if (cb->change) mask |= (IN_MODIFY | IN_ATTRIB);
+
+    return mask;
+
+}
+
+void assign_watchbackend(struct notifywatch_struct *watch)
+{
+    int result=0;
+
+    result=(* os_watchbackend.set_watch)(watch);
+
+    if (result>=0) {
+
+	/* success */
+
+	watch->backend=&os_watchbackend;
+
+    } else if (result==-ENOSYS) {
+
+	result=(* fssync_watchbackend.set_watch)(watch);
+
+	if (result>=0) {
+
+	    watch->backend=&fssync_watchbackend;
+
+	} else {
+
+	    logoutput_error("assign_watchbackend: error %i setting fssync watch on %s", abs(result), watch->pathinfo.path);
+
+	}
+
+    } else {
+
+	logoutput_error("assign_watchbackend: error %i setting os watch on %s", abs(result), watch->pathinfo.path);
+
+    }
+
+}
+
+struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t mask, struct pathinfo_struct *pathinfo, struct workspace_object_struct *object, unsigned int *error)
+{
+    struct notifywatch_struct *watch=NULL;
+    int result=0;
+
+    if (mask==0) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (! pathinfo) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (! pathinfo->path) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (! inode) {
+
+	*error=EINVAL;
+	goto out;
+
+    }
+
+    /* possible here compare the pathinfo->path with the one stored in watch->pathinfo.path*/
+
+    logoutput("add_notifywatch: on %s mask %i", pathinfo->path, (int) mask);
+
+    watch=lookup_watch_inode(inode);
+    if (! watch) watch=lookup_watch_systemwatches(pathinfo);
+
     if ( ! watch ) {
 
-	logoutput("add_watch: no watch found, creating one");
+	logoutput("add_notifywatch: no watch found, creating one");
 
 	watch=malloc(sizeof(struct notifywatch_struct));
 
 	if (watch) {
 
+	    watch->flags=NOTIFYWATCH_FLAG_NOTIFY;
 	    watch->inode=inode;
-	    watch->mask=mask;
+	    watch->object=object;
+	    watch->notifymask=mask;
 	    pthread_mutex_init(&watch->mutex, NULL);
+
 	    watch->backend=NULL;
+	    watch->cb=NULL;
+	    watch->data=NULL;
+
+	    watch->next=NULL;
+	    watch->prev=NULL;
 
 	    /* take over the path only if allocated and not inuse */
 
@@ -345,7 +509,7 @@ struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t 
 
 		} else {
 
-		    logoutput("add_watch: error allocating memory for path %s", pathinfo->path);
+		    logoutput("add_notifywatch: error allocating memory for path %s", pathinfo->path);
 		    free(watch);
 		    watch=NULL;
 		    goto out;
@@ -355,42 +519,60 @@ struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t 
 	    }
 
 	    add_watch_inodetable(watch);
-	    add_watch_ctrtable(watch);
+	    watch->mask=mask;
 
 	} else {
 
-	    logoutput("add_clientwatch: unable to allocate a watch");
+	    logoutput("add_notifywatch: unable to allocate a watch");
 	    goto out;
 
 	}
+
+	pthread_mutex_lock(&watch->mutex);
+
+	/*
+	    assign the backend: inotify, fssync....
+	*/
+
+	assign_watchbackend(watch);
+
+	unlock:
+
+	pthread_mutex_unlock(&watch->mutex);
 
     } else {
 
 	/* existing watch found */
 
-	logoutput("add_clientwatch: existing watch found on %s", pathinfo->path);
+	logoutput("add_notifywatch: existing watch found on %s", pathinfo->path);
+
+	pthread_mutex_lock(&watch->mutex);
+
+	if ( ! (watch->flags & NOTIFYWATCH_FLAG_NOTIFY)) {
+	    uint32_t current_mask=0;
+
+	    watch->flags |= NOTIFYWATCH_FLAG_NOTIFY;
+
+	    watch->inode=inode;
+	    add_watch_inodetable(watch);
+
+	    current_mask=watch->mask;
+
+	    watch->notifymask=mask;
+	    watch->mask = watch->notifymask;
+	    if (watch->cb) watch->mask |= get_cbmask(watch->cb);
+
+	    if (watch->mask != current_mask) (* watch->backend->change_watch) (watch);
+
+	} else {
+
+	    *error=EEXIST;
+
+	}
+
+	pthread_mutex_unlock(&watch->mutex);
 
     }
-
-    pthread_mutex_lock(&watch->mutex);
-
-    /* dealing with a normal filesystem */
-
-    result=set_watch_backend_os_specific(watch);
-
-    if (result==-EACCES) {
-
-	logoutput("add_clientwatch: no access to %s", pathinfo->path);
-
-    } else if (result<0) {
-
-	logoutput("add_clientwatch: error %i setting watch on %s", abs(result), pathinfo->path);
-
-    }
-
-    unlock:
-
-    pthread_mutex_unlock(&watch->mutex);
 
     out:
 
@@ -398,23 +580,55 @@ struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t 
 
 }
 
-/* change/remove a watch */
+/*
+    change/remove a watch
+*/
 
-void change_notifywatch(struct notifywatch_struct *watch)
+void change_notifywatch(struct notifywatch_struct *watch, uint32_t mask)
 {
+    uint32_t current_mask;
+
+    if (! watch->inode) return;
+
+    logoutput("change_notifywatch: new mask %i", (int) mask);
 
     pthread_mutex_lock(&watch->mutex);
 
-    if (watch->mask==0) {
+    current_mask=watch->mask;
+    watch->notifymask=mask;
 
-	remove_watch_backend_os_specific(watch);
+    if (watch->notifymask==0) {
 
-	remove_watch_inodetable(watch);
-	remove_watch_ctrtable(watch);
+	if (watch->flags & NOTIFYWATCH_FLAG_NOTIFY) {
+
+	    watch->flags -= NOTIFYWATCH_FLAG_NOTIFY;
+
+	    remove_watch_inodetable(watch);
+	    watch->inode=NULL;
+
+	}
+
+	watch->mask=0;
+	if (watch->cb) watch->mask=get_cbmask(watch->cb);
+
+	if (watch->mask==0) {
+
+	    (* watch->backend->remove_watch) (watch);
+
+	    remove_watch_systemwatches(watch);
+
+	} else if (watch->mask != current_mask) {
+
+	    (* watch->backend->change_watch) (watch);
+
+	}
 
     } else {
 
-	change_watch_backend_os_specific(watch);
+	watch->mask = watch->notifymask;
+	if (watch->cb) watch->mask |= get_cbmask(watch->cb);
+
+	if (watch->mask != current_mask) (* watch->backend->change_watch) (watch);
 
     }
 
@@ -423,9 +637,276 @@ void change_notifywatch(struct notifywatch_struct *watch)
     if (watch->mask==0) {
 
 	pthread_mutex_destroy(&watch->mutex);
+	free_path_pathinfo(&watch->pathinfo);
+
 	free(watch);
 
     }
+
+}
+
+struct notifywatch_struct *add_systemwatch(struct pathinfo_struct *pathinfo, struct watchcb_struct *cb, unsigned int *error)
+{
+    struct notifywatch_struct *watch=NULL;
+    int result=0;
+
+    if (! pathinfo) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (! pathinfo->path) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (! cb) {
+
+	*error=EINVAL;
+	goto out;
+
+    } else if (get_cbmask(cb)==0) {
+
+	*error=EINVAL;
+	goto out;
+
+    }
+
+    watch=lookup_watch_systemwatches(pathinfo);
+
+    if (! watch) {
+        struct inode_struct *inode=NULL;
+
+	/*
+	    no watch found in the path table of system watches
+	    it's possible that there is still watch set on the inode
+	    translate path to inode
+	*/
+
+	watch=lookup_watch_inodetable_bypath(pathinfo->path);
+
+    }
+
+    if ( ! watch ) {
+
+	logoutput("add_systemwatch: no watch found, creating one");
+
+	watch=malloc(sizeof(struct notifywatch_struct));
+
+	if (watch) {
+
+	    watch->flags=NOTIFYWATCH_FLAG_SYSTEM;
+	    watch->inode=NULL;
+	    watch->object=NULL;
+	    pthread_mutex_init(&watch->mutex, NULL);
+
+	    watch->backend=NULL;
+	    watch->cb=cb;
+	    watch->data=NULL;
+
+	    watch->notifymask=0;
+
+	    watch->next=NULL;
+	    watch->prev=NULL;
+
+	    /* take over the path only if allocated and not inuse */
+
+	    if ((!(pathinfo->flags & PATHINFOFLAGS_INUSE)) && (pathinfo->flags & PATHINFOFLAGS_ALLOCATED)) {
+
+		watch->pathinfo.path=pathinfo->path;
+		watch->pathinfo.len=pathinfo->len;
+		watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
+		pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+		watch->pathinfo.flags=pathinfo->flags;
+
+	    } else {
+
+		watch->pathinfo.path=malloc(pathinfo->len);
+
+		if (watch->pathinfo.path) {
+
+		    memcpy(watch->pathinfo.path, pathinfo->path, pathinfo->len);
+		    watch->pathinfo.len=pathinfo->len;
+		    watch->pathinfo.flags=pathinfo->flags;
+		    watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
+
+		} else {
+
+		    logoutput("add_systemwatch: error allocating memory for path %s", pathinfo->path);
+		    free(watch);
+		    watch=NULL;
+		    goto out;
+
+		}
+
+	    }
+
+	    watch->mask=get_cbmask(cb);
+	    add_watch_systemwatches(watch);
+
+	} else {
+
+	    logoutput("add_systemwatch: unable to allocate a watch");
+	    goto out;
+
+	}
+
+	pthread_mutex_lock(&watch->mutex);
+
+	/*
+	    assign the backend: inotify, fssync....
+	*/
+
+	logoutput("add_systemwatch: assign watch backend");
+
+	assign_watchbackend(watch);
+
+	pthread_mutex_unlock(&watch->mutex);
+
+    } else {
+
+	/* existing watch found */
+
+	logoutput("add_systemwatch: existing watch found on %s", pathinfo->path);
+
+	pthread_mutex_lock(&watch->mutex);
+
+	if ( ! (watch->flags & NOTIFYWATCH_FLAG_SYSTEM)) {
+	    uint32_t current_mask=0;
+
+	    watch->cb=cb;
+	    add_watch_systemwatches(watch);
+
+	    watch->flags |= NOTIFYWATCH_FLAG_SYSTEM;
+
+	    current_mask=watch->mask;
+	    watch->mask=get_cbmask(cb);
+	    if (watch->inode) watch->mask |= watch->notifymask;
+
+	    if (current_mask != watch->mask) (* watch->backend->change_watch) (watch);
+
+	} else {
+
+	    *error=EEXIST;
+
+	}
+
+	pthread_mutex_unlock(&watch->mutex);
+
+    }
+
+    out:
+
+    logoutput("add_systemwatch: ready");
+
+    return watch;
+
+}
+
+void remove_systemwatch(struct notifywatch_struct *watch)
+{
+
+    pthread_mutex_lock(&watch->mutex);
+
+    if (watch->flags & NOTIFYWATCH_FLAG_SYSTEM) {
+
+	watch->cb=NULL;
+	remove_watch_systemwatches(watch);
+
+	watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
+
+    }
+
+    if (watch->flags & NOTIFYWATCH_FLAG_NOTIFY) {
+	uint32_t current_mask=watch->mask;
+
+	watch->mask=watch->notifymask;
+
+	if (current_mask != watch->mask) (* watch->backend->change_watch) (watch);
+
+    } else {
+
+	watch->mask=0;
+	(* watch->backend->remove_watch) (watch);
+
+    }
+
+    pthread_mutex_unlock(&watch->mutex);
+
+    if (watch->mask==0 && ! (watch->flags & NOTIFYWATCH_FLAG_NOTIFY)) {
+
+	pthread_mutex_destroy(&watch->mutex);
+	free_path_pathinfo(&watch->pathinfo);
+	free(watch);
+
+    }
+
+}
+
+static void remove_notifywatch_cb(void *data)
+{
+    struct notifywatch_struct *watch=(struct notifywatch_struct *) data;
+
+    if (watch) {
+
+	if (watch->backend) {
+
+	    (* watch->backend->remove_watch) (watch);
+
+	}
+
+	if (watch->flags & NOTIFYWATCH_FLAG_NOTIFY) {
+
+	    watch->flags -= NOTIFYWATCH_FLAG_NOTIFY;
+
+	    remove_watch_inodetable(watch);
+	    watch->inode=NULL;
+
+	}
+
+	if (watch->flags & NOTIFYWATCH_FLAG_SYSTEM) {
+
+	    watch->cb=NULL;
+	    remove_watch_systemwatches(watch);
+
+	    watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
+
+	}
+
+	pthread_mutex_destroy(&watch->mutex);
+	free_path_pathinfo(&watch->pathinfo);
+	free(watch);
+
+    }
+
+}
+
+void remove_systemwatches()
+{
+    struct notifywatch_struct *watch=NULL;
+
+    pthread_mutex_lock(&systemwatches.mutex);
+
+    watch=systemwatches.first;
+
+    while (watch) {
+
+	systemwatches.first=watch->next;
+
+	remove_systemwatch(watch);
+
+	watch=systemwatches.first;
+
+    }
+
+    pthread_mutex_unlock(&systemwatches.mutex);
+
+}
+
+void remove_notifywatches()
+{
+
+    free_group(&group_watches_inode, remove_notifywatch_cb);
 
 }
 
@@ -445,12 +926,23 @@ int init_fschangenotify(unsigned int *error)
 
     }
 
+    /* set the watch backend functions for this os*/
+
+    os_watchbackend.type=NOTIFYWATCH_BACKEND_OS;
+    os_watchbackend.set_watch=set_watch_backend_os_specific;
+    os_watchbackend.change_watch=change_watch_backend_os_specific;
+    os_watchbackend.remove_watch=remove_watch_backend_os_specific;
+
     return (*error>0) ? -1 : 0;
 
 }
 
 void end_fschangenotify()
 {
+
+    remove_systemwatches();
+
+    remove_notifywatches();
 
     close_fsnotify_backend();
 

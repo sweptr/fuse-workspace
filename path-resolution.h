@@ -22,14 +22,11 @@
 
 typedef char pathstring[PATH_MAX+1];
 
-#define CALL_INFO_INIT	{NULL, {NULL, 0, 0}, 0, 0, 0, 0, 0}
+#define CALL_INFO_INIT	{{NULL, 0, 0}, 0, 0, 0, 0, NULL, NULL, 0, 0}
 
 #define PATHINFOFLAGS_NONE		0
 #define PATHINFOFLAGS_ALLOCATED		1
 #define PATHINFOFLAGS_INUSE		2
-
-#define _OVERLAYFS_MODE_FINISH		1
-#define _OVERLAYFS_MODE_VIRTUAL		2
 
 struct pathinfo_struct {
     char *path;
@@ -38,39 +35,28 @@ struct pathinfo_struct {
 };
 
 struct call_info_struct {
-    struct entry_struct *entry;
     struct pathinfo_struct pathinfo;
     pid_t pid;
     uid_t uid;
     gid_t gid;
     mode_t umask;
+    struct workspace_mount_struct *workspace_mount;
+    struct workspace_object_struct *object;
+    unsigned int relpath;
     unsigned int error;
-};
-
-struct overlayfs_dirp_struct {
-    struct entry_struct *parent;
-    struct entry_struct *entry;
-    off_t offset;
-    unsigned int fd;
-    unsigned char mode;
-    struct timespec synctime;
-    char *buffer;
-    size_t size;
-    unsigned int pos;
-    unsigned int read;
-    unsigned int lenpath;
 };
 
 // Prototypes
 
-int get_path(struct call_info_struct *call_info, unsigned int *error);
-int get_path_extra(struct call_info_struct *call_info, const char *name, unsigned int *error);
+int get_path(struct call_info_struct *call_info, struct entry_struct *entry, unsigned int *error);
+int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entry, struct name_struct *extraname, unsigned int *error);
 
 void free_path_pathinfo(struct pathinfo_struct *pathinfo);
 
 int init_pathcache_group(unsigned int *error);
 void clean_pathcache();
-void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry);
+void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry, struct workspace_object_struct *object, unsigned int relpath);
+void destroy_pathcache();
 
 void adjust_pathmax(unsigned int len);
 unsigned int get_pathmax();
