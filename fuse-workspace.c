@@ -122,22 +122,28 @@ static inline void dummy_nolog()
 #include "readdir-utils.h"
 
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
 
 struct fs_options_struct fs_options;
 struct workerthreads_queue_struct workerthreads_queue;
-struct fuse_args global_fuse_args = FUSE_ARGS_INIT(0, NULL);
+char *program_name=NULL;
 
 extern const char *rootpath;
 extern const char *dotdotname;
 extern const char *dotname;
+
+pid_t gettid()
+{
+    return (pid_t) syscall(SYS_gettid);
+}
 
 static void workspace_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 {
     struct inode_struct *pinode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("LOOKUP: name %s, parent ino %li", name, (long) ino);
+    logoutput("LOOKUP: name %s, parent ino %li (thread %i)", name, (long) ino, (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -154,32 +160,28 @@ static void workspace_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 	struct entry_struct *parent = pinode->alias;
 	struct name_struct xname={NULL, 0, 0};
 	unsigned int error=0;
+	struct call_info_struct call_info=CALL_INFO_INIT;
+	const struct fuse_ctx *ctx=fuse_req_ctx(req);
 
 	xname.name=(char *) name;
 	xname.len=strlen(name);
 
 	calculate_nameindex(&xname);
 
+	call_info.pid=ctx->pid;
+	call_info.uid=ctx->uid;
+	call_info.gid=ctx->gid;
+	call_info.umask=ctx->umask;
+
+	call_info.pathinfo.path=NULL;
+	call_info.pathinfo.len=0;
+	call_info.pathinfo.flags=0;
+
+	call_info.workspace_mount=workspace_mount;
+
 	entry=find_entry(parent, &xname, &error);
 
 	if (entry) {
-	    struct call_info_struct call_info=CALL_INFO_INIT;
-	    const struct fuse_ctx *ctx=fuse_req_ctx(req);
-
-	    call_info.pid=ctx->pid;
-	    call_info.uid=ctx->uid;
-	    call_info.gid=ctx->gid;
-	    call_info.umask=ctx->umask;
-
-	    call_info.pathinfo.path=NULL;
-	    call_info.pathinfo.len=0;
-	    call_info.pathinfo.flags=0;
-
-	    call_info.workspace_mount=workspace_mount;
-
-	    /* get the path and the object */
-
-	    logoutput("lookup: entry exist");
 
 	    if (get_path(&call_info, entry, &error)==0) {
 		struct workspace_object_struct *object=call_info.object;
@@ -190,28 +192,13 @@ static void workspace_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 
 	    } else {
 
+		free_path_pathinfo(&call_info.pathinfo);
 		fuse_reply_err(req, error);
+
 
 	    }
 
-	    free_path_pathinfo(&call_info.pathinfo);
-
 	} else {
-	    struct call_info_struct call_info=CALL_INFO_INIT;
-	    const struct fuse_ctx *ctx=fuse_req_ctx(req);
-
-	    call_info.pid=ctx->pid;
-	    call_info.uid=ctx->uid;
-	    call_info.gid=ctx->gid;
-	    call_info.umask=ctx->umask;
-
-	    call_info.pathinfo.path=NULL;
-	    call_info.pathinfo.len=0;
-	    call_info.pathinfo.flags=0;
-
-	    call_info.workspace_mount=workspace_mount;
-
-	    logoutput("lookup: entry nonexist");
 
 	    if (get_path_extra(&call_info, parent, &xname, &error)==0) {
 		struct workspace_object_struct *object=call_info.object;
@@ -222,11 +209,10 @@ static void workspace_lookup(fuse_req_t req, fuse_ino_t ino, const char *name)
 
 	    } else {
 
+		free_path_pathinfo(&call_info.pathinfo);
 		fuse_reply_err(req, error);
 
 	    }
-
-	    free_path_pathinfo(&call_info.pathinfo);
 
 	}
 
@@ -243,7 +229,7 @@ static void workspace_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
     struct inode_struct *inode;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("FORGET: ino %li", (long) ino);
+    logoutput("FORGET: ino %li (thread %i)", (long) ino, (int) gettid());
 
     inode = remove_inode(ino, decrease_inodes_workspace, (void *) workspace_mount);
 
@@ -288,7 +274,7 @@ static void workspace_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 	if (fi->fh) {
 	    struct workspace_fh_struct *fh=(struct workspace_fh_struct *) (uintptr_t) fi->fh;
 
-	    logoutput("FGETATTR");
+	    logoutput("FGETATTR (thread %i)", (int) gettid());
 
 	    (* fh->object->module_calls.fgetattr) (req, fh);
 
@@ -301,7 +287,7 @@ static void workspace_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("GETATTR");
+    logoutput("GETATTR (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -362,7 +348,7 @@ static void workspace_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *st, i
 	if (fi->fh) {
 	    struct workspace_fh_struct *fh=(struct workspace_fh_struct *) (uintptr_t) fi->fh;
 
-	    logoutput("FSETATTR");
+	    logoutput("FSETATTR (thread %i)", (int) gettid());
 
 	    (* fh->object->module_calls.fsetattr) (req, fh, st, fuse_set);
 
@@ -375,7 +361,7 @@ static void workspace_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *st, i
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("SETATTR");
+    logoutput("SETATTR (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -441,7 +427,7 @@ static void workspace_mkdir(fuse_req_t req, fuse_ino_t ino, const char *name, mo
 
     }
 
-    logoutput("MKDIR, name: %s", name);
+    logoutput("MKDIR, name: %s (thread %i)", name, (int) gettid());
 
     if (pinode) {
 	struct entry_struct *entry = NULL;
@@ -505,7 +491,7 @@ static void workspace_mknod(fuse_req_t req, fuse_ino_t ino, const char *name, mo
     struct inode_struct *pinode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("MKNOD, name: %s", name);
+    logoutput("MKNOD, name: %s (thread %i)", name, (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -579,7 +565,7 @@ static void workspace_symlink(fuse_req_t req, const char *link, fuse_ino_t ino, 
     struct inode_struct *pinode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("SYMLINK, name: %s", name);
+    logoutput("SYMLINK, name: %s (thread %i)", name, (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -653,7 +639,7 @@ static void workspace_rmdir(fuse_req_t req, fuse_ino_t ino, const char *name)
     struct inode_struct *pinode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("RMDIR, name: %s", name);
+    logoutput("RMDIR, name: %s (thread %i)", name, (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -727,7 +713,7 @@ static void workspace_unlink(fuse_req_t req, fuse_ino_t ino, const char *name)
     struct inode_struct *pinode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("RMDIR, name: %s", name);
+    logoutput("UNLINK, name: %s (thread %i)", name, (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -801,7 +787,7 @@ static void workspace_readlink(fuse_req_t req, fuse_ino_t ino)
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("READLINK");
+    logoutput("READLINK (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -898,7 +884,7 @@ void workspace_rename(fuse_req_t req, fuse_ino_t pino, const char *name, fuse_in
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
     unsigned int error=0;
 
-    logoutput("RENAME");
+    logoutput("RENAME (thread %i)", (int) gettid());
 
     if (pino==FUSE_ROOT_ID) {
 
@@ -1067,7 +1053,7 @@ static void workspace_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("OPENDIR");
+    logoutput("OPENDIR (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -1114,10 +1100,11 @@ static void workspace_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 	    if (dh) {
 
 		dh->parent=inode->alias;
+		dh->entry=NULL;
 		dh->object=object;
 		dh->pathinfo.path=call_info.pathinfo.path;
 		dh->pathinfo.len=call_info.pathinfo.len;
-		dh->pathinfo.path=call_info.pathinfo.path;
+		dh->pathinfo.flags=call_info.pathinfo.flags;
 		dh->directory=directory;
 
 		dh->synctime.tv_sec=0;
@@ -1125,7 +1112,6 @@ static void workspace_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
 
 		dh->relpath=call_info.relpath;
 		dh->mode=0;
-
 		if (directory->count>0) dh->mode |= _WORKSPACE_READDIR_MODE_NONEMPTY;
 		get_current_time(&dh->synctime);
 
@@ -1166,6 +1152,8 @@ static void workspace_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t
 {
     struct workspace_dh_struct *dh=(struct workspace_dh_struct *) ( uintptr_t) fi->fh;
 
+    logoutput("READDIR (thread %i)", (int) gettid());
+
     if (dh->mode & _WORKSPACE_READDIR_MODE_FINISH) {
 
 	fuse_reply_buf(req, NULL, 0);
@@ -1184,16 +1172,40 @@ static void workspace_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t
 static void workspace_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     struct workspace_dh_struct *dh=(struct workspace_dh_struct *) ( uintptr_t) fi->fh;
-    struct workspace_object_struct *object=dh->object;
 
-    (* object->module_calls.readdirplus) (req, size, offset, dh);
+    logoutput("READDIRPLUS (thread %i)", (int) gettid());
+
+    if (dh->mode & _WORKSPACE_READDIR_MODE_FINISH) {
+
+	fuse_reply_buf(req, NULL, 0);
+
+	return;
+
+    } else {
+	struct workspace_object_struct *object=dh->object;
+
+	(* object->module_calls.readdirplus) (req, size, offset, dh);
+
+    }
 
 }
+
+static void workspace_fsyncdir(fuse_req_t req, fuse_ino_t ino, int datasync, struct fuse_file_info *fi)
+{
+    struct workspace_dh_struct *dh=(struct workspace_dh_struct *) ( uintptr_t) fi->fh;
+    struct workspace_object_struct *object=dh->object;
+
+    logoutput("FSYNCDIR (thread %i)", (int) gettid());
+
+}
+
 
 static void workspace_releasedir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     struct workspace_dh_struct *dh=(struct workspace_dh_struct *) ( uintptr_t) fi->fh;
     struct workspace_object_struct *object=dh->object;
+
+    logoutput("RELEASEDIR (thread %i)", (int) gettid());
 
     (* object->module_calls.releasedir) (req, dh);
 
@@ -1219,7 +1231,7 @@ static void workspace_create(fuse_req_t req, fuse_ino_t ino, const char *name, m
 
     }
 
-    logoutput("CREATE, name: %s", name);
+    logoutput("CREATE, name: %s (thread %i)", name, (int) gettid());
 
     if (pinode) {
 	struct entry_struct *entry = NULL;
@@ -1253,6 +1265,8 @@ static void workspace_create(fuse_req_t req, fuse_ino_t ino, const char *name, m
 		struct workspace_fh_struct *fh=malloc(sizeof(struct workspace_fh_struct));
 		struct workspace_object_struct *object=call_info.object;
 
+		logoutput("CREATE: %s, calls %s", call_info.pathinfo.path, object->module_calls.name);
+
 		if (fh) {
 
 		    fh->entry=entry;
@@ -1260,6 +1274,7 @@ static void workspace_create(fuse_req_t req, fuse_ino_t ino, const char *name, m
 		    fh->pathinfo.path=call_info.pathinfo.path;
 		    fh->pathinfo.len=call_info.pathinfo.len;
 		    fh->pathinfo.path=call_info.pathinfo.path;
+		    fh->relpath=call_info.relpath;
 
 		    call_info.pathinfo.path=NULL;
 		    call_info.pathinfo.len=0;
@@ -1305,7 +1320,7 @@ static void workspace_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("OPEN");
+    logoutput("OPEN (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -1337,13 +1352,16 @@ static void workspace_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info
 	    struct workspace_object_struct *object=call_info.object;
 	    struct workspace_fh_struct *fh=malloc(sizeof(struct workspace_fh_struct));
 
+	    logoutput("OPEN: %s", call_info.pathinfo.path);
+
 	    if (fh) {
 
 		fh->entry=inode->alias;
 		fh->object=object;
+		fh->relpath=call_info.relpath;
 		fh->pathinfo.path=call_info.pathinfo.path;
 		fh->pathinfo.len=call_info.pathinfo.len;
-		fh->pathinfo.path=call_info.pathinfo.path;
+		fh->pathinfo.flags=call_info.pathinfo.flags;
 		fh->flags = (fi->flags & O_ACCMODE) | O_NOFOLLOW;
 
 		call_info.pathinfo.path=NULL;
@@ -1384,7 +1402,7 @@ static void workspace_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t of
     struct workspace_fh_struct *fh=(struct workspace_fh_struct *) ( uintptr_t) fi->fh;
     struct workspace_object_struct *object=fh->object;
 
-    logoutput("READ");
+    logoutput("READ (thread %i)", (int) gettid());
 
     (* object->module_calls.read) (req, size, offset, fh);
 
@@ -1395,7 +1413,7 @@ static void workspace_write(fuse_req_t req, fuse_ino_t ino, const char *buff, si
     struct workspace_fh_struct *fh=(struct workspace_fh_struct *) ( uintptr_t) fi->fh;
     struct workspace_object_struct *object=fh->object;
 
-    logoutput("WRITE");
+    logoutput("WRITE (thread %i)", (int) gettid());
 
     (* object->module_calls.write) (req, buff, size, offset, fh);
 
@@ -1406,7 +1424,7 @@ static void workspace_fsync(fuse_req_t req, fuse_ino_t ino, int datasync, struct
     struct workspace_fh_struct *fh=(struct workspace_fh_struct *) ( uintptr_t) fi->fh;
     struct workspace_object_struct *object=fh->object;
 
-    logoutput("FSYNC");
+    logoutput("FSYNC (thread %i)", (int) gettid());
 
     (* object->module_calls.fsync) (req, datasync, fh);
 
@@ -1418,14 +1436,9 @@ static void workspace_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_i
     struct workspace_fh_struct *fh=(struct workspace_fh_struct *) ( uintptr_t) fi->fh;
     struct workspace_object_struct *object=fh->object;
 
-    logoutput("RELEASE");
+    logoutput("RELEASE (thread %i)", (int) gettid());
 
     (* object->module_calls.release) (req, fh);
-
-    free_path_pathinfo(&fh->pathinfo);
-
-    free(fh);
-    fi->fh=0;
 
 }
 
@@ -1435,7 +1448,7 @@ static void workspace_statfs(fuse_req_t req, fuse_ino_t ino)
     struct statvfs st;
     unsigned int error=0;
 
-    logoutput("STATFS: ino %lli", (long long) ino);
+    logoutput("STATFS: ino %lli (thread %i)", (long long) ino, (int) gettid());
 
     memset(&st, 0, sizeof(statvfs));
 
@@ -1486,7 +1499,7 @@ static void workspace_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
     struct inode_struct *inode=NULL;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("FSNOTIFY");
+    logoutput("FSNOTIFY (thread %i)", (int) gettid());
 
     if (ino==FUSE_ROOT_ID) {
 
@@ -1542,14 +1555,14 @@ static void workspace_fsnotify(fuse_req_t req, fuse_ino_t ino, uint32_t mask)
 static void workspace_init (void *userdata, struct fuse_conn_info *conn)
 {
 
-    logoutput("INIT");
+    logoutput("INIT (thread %i)", (int) gettid());
 
 }
 
 static void workspace_destroy (void *userdata)
 {
 
-    logoutput("DESTROY");
+    logoutput("DESTROY (thread %i)", (int) gettid());
 
 
 }
@@ -1559,7 +1572,7 @@ static void workspace_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name,
     struct inode_struct *inode;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("GETXATTR, name %s", name);
+    logoutput("GETXATTR, name %s (thread %i)", name, (int) gettid());
 
     if (strcmp(name, "system.posix_acl_access")==0 || strcmp(name, "system.posix_acl_default")==0) goto out;
 
@@ -1646,7 +1659,7 @@ static void workspace_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
     struct inode_struct *inode;
     struct workspace_mount_struct *workspace_mount=(struct workspace_mount_struct *) fuse_req_userdata(req);
 
-    logoutput("LISTXATTR");
+    logoutput("LISTXATTR (thread %i)", (int) gettid());
 
     inode=find_inode(ino);
 
@@ -1776,8 +1789,12 @@ struct fuse_lowlevel_ops workspace_oper = {
     .readlink	= workspace_readlink,
     .opendir	= workspace_opendir,
     .readdir	= workspace_readdir,
+/*
     .readdirplus= workspace_readdirplus,
+
+*/
     .releasedir	= workspace_releasedir,
+    .fsyncdir	= workspace_fsyncdir,
     .create	= workspace_create,
     .open	= workspace_open,
     .read	= workspace_read,
@@ -1800,10 +1817,11 @@ int main(int argc, char *argv[])
     umask(0);
 
     open_logoutput(); 
+    program_name=argv[0];
 
     /* parse commandline options and initialize the fuse options */
 
-    if (parse_arguments(argc, argv, &global_fuse_args, &error)==-1) {
+    if (parse_arguments(argc, argv, &error)==-1) {
 
 	if (error>0) fprintf(stderr, "Error, cannot parse arguments (error: %i).\n", error);
 
@@ -1828,12 +1846,12 @@ int main(int argc, char *argv[])
 
     /* init the hash lookup tables */
 
-    if (init_pathcache_group(&error)==-1) {
+    //if (init_pathcache_group(&error)==-1) {
 
-	fprintf(stderr, "Error, cannot intialize pathcache (error: %i).\n", error);
-	exit(1);
+	//fprintf(stderr, "Error, cannot intialize pathcache (error: %i).\n", error);
+	//exit(1);
 
-    }
+    //}
 
     if (init_inode_hashtable(&error)==-1) {
 
@@ -1935,13 +1953,9 @@ int main(int argc, char *argv[])
 
     end_fschangenotify();
 
-    /* remove any remaining xdata from mainloop */
-
     logoutput("main:destroy eventloop");
 
     destroy_beventloop(NULL);
-
-    fuse_opt_free_args(&global_fuse_args);
 
     skipeverything:
 

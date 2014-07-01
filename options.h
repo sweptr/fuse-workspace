@@ -39,7 +39,7 @@ struct fs_options_struct {
 
 // Prototypes
 
-int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsigned int *error);
+int parse_arguments(int argc, char *argv[], unsigned int *error);
 
 #endif
 

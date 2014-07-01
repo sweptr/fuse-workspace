@@ -17,10 +17,24 @@
 
 */
 
-#ifndef FUSE_BROWSE_OVERLAY_H
-#define FUSE_BROWSE_OVERLAY_H
+#ifndef FUSE_SMBCLI_COMMON_H
+#define FUSE_SMBCLI_COMMON_H
 
-struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
-void set_module_calls_overlay(struct module_calls_struct *mcalls);
+/* struct per connection to server/share */
+
+struct smbcli_manager_struct {
+    TALLOC_CTX				*memory_ctx;
+    struct smbcli_state 		*cli;
+    struct cli_credentials 		*credentials;
+    pthread_mutex_t			mutex;
+    struct timespec			connect_time;
+    unsigned int			error;
+};
+
+int create_smbcli_manager(struct net_smb_share_struct *smb_share, unsigned int *error);
+int connect_smbcli_manager(struct net_smb_share_struct *smb_share, struct smbcli_manager_struct *manager, unsigned int *error);
+
+void convert_path_smb(struct pathinfo_struct *pathinfo, char *path);
+void convert_path_smb_reverse(struct pathinfo_struct *pathinfo);
 
 #endif

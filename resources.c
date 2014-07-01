@@ -54,8 +54,77 @@
 #include "simple-list.h"
 
 extern struct global_options_struct fs_options;
+
 static struct resource_struct *resources=NULL;
 static pthread_mutex_t resources_mutex=PTHREAD_MUTEX_INITIALIZER;
+
+static struct workspace_host_struct *hosts=NULL;
+static pthread_mutex_t hosts_mutex=PTHREAD_MUTEX_INITIALIZER;
+
+static struct workspace_host_struct *lookup_host_ipv4(char *ipv4)
+{
+    struct workspace_host_struct *host=NULL;
+
+    host=hosts;
+
+    while (host) {
+
+	if (memcmp(host->ipv4, ipv4, INET_ADDRSTRLEN)==0) break;
+	host=host->next;
+
+    }
+
+
+    return host;
+
+}
+
+static struct workspace_host_struct *create_host()
+{
+    struct workspace_host_struct *host=malloc(sizeof(struct workspace_host_struct));
+
+    if (host) {
+
+	host->options=0;
+	memset(host->ipv4, '\0', INET_ADDRSTRLEN+1);
+	memset(host->ipv6, '\0', INET6_ADDRSTRLEN+1);
+	host->hostname=NULL;
+	host->next=NULL;
+
+    }
+
+    return host;
+
+}
+
+struct workspace_host_struct *get_host_ipv4(char *ipv4)
+{
+    struct workspace_host_struct *host=NULL;
+
+    pthread_mutex_lock(&hosts_mutex);
+
+    host=lookup_host_ipv4(ipv4);
+
+    if (! host) {
+
+	host=create_host();
+
+	if (host) {
+
+	    memcpy(host->ipv4, ipv4, INET_ADDRSTRLEN);
+	    host->next=hosts;
+	    hosts=host;
+
+	}
+
+    }
+
+    pthread_mutex_unlock(&hosts_mutex);
+
+    return host;
+
+}
+
 
 void init_resource(struct resource_struct *resource)
 {
@@ -161,3 +230,25 @@ void free_resource(struct resource_struct *resource)
 
 }
 
+void free_workspace_uri(struct workspace_uri_struct *uri)
+{
+
+    if (uri->address) {
+
+	free(uri->address);
+	uri->address=NULL;
+
+    }
+
+    if (uri->group==RESOURCE_GROUP_SMB) {
+
+	if (uri->type.smbinfo.authdata) {
+
+	    free(uri->type.smbinfo.authdata);
+	    uri->type.smbinfo.authdata=NULL;
+
+	}
+
+    }
+
+}

@@ -432,7 +432,7 @@ int monitor_usersessions(void (* cb) (char *user, uid_t uid, unsigned char what)
 
     pathinfo.path=path;
     pathinfo.len=strlen(path) + 1;
-    pathinfo.flags=PATHINFOFLAGS_INUSE;
+    pathinfo.flags=PATHINFO_FLAGS_INUSE;
 
     session_path=path;
     session_cb=cb;

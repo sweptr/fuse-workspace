@@ -1003,7 +1003,21 @@ struct directory_struct *get_directory(struct inode_struct *inode, unsigned char
 
 	}
 
-	if (! directory && create==1) directory=create_directory(inode, error);
+	if (! directory) {
+
+	    /*
+		look for an object attached to this inode, 
+		and when there is one, check the resource, is that public or of the same user
+		if that's the case resuse that
+		- look for object (inode->object?)
+		- test resource (object->resource)
+		- if (resource->refcount>1) then this resource is used somewhere else
+		- look for all other objects which point to this resource and find the directory (other_object->inode -> directory)
+	    */
+
+	    if (create==1) directory=create_directory(inode, error);
+
+	}
 
     } else {
 

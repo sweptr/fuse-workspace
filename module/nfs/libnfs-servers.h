@@ -17,10 +17,9 @@
 
 */
 
-#ifndef FUSE_BROWSE_OVERLAY_H
-#define FUSE_BROWSE_OVERLAY_H
+#ifndef FUSE_LIBNFS_SERVERS_H
+#define FUSE_LIBNFS_SERVERS_H
 
-struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
-void set_module_calls_overlay(struct module_calls_struct *mcalls);
+void set_module_calls_libnfs_server(struct module_calls_struct *mcalls);
 
 #endif

@@ -55,6 +55,7 @@
 #include "path-resolution.h"
 
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
 #include "module/virtual/browsevirtual.h"
 #include <linux/fuse.h>
@@ -94,8 +95,8 @@ static inline void dummy_nolog()
 
 extern struct fs_options_struct fs_options;
 extern struct workerthreads_queue_struct workerthreads_queue;
-extern struct fuse_args global_fuse_args;
 extern struct fuse_lowlevel_ops workspace_oper;
+extern char *program_name;
 
 extern const char *dotdotname;
 extern const char *dotname;
@@ -915,7 +916,7 @@ struct workspace_mount_struct *create_workspace_mount(unsigned int *error)
 	rootinode->uid=0;
 	rootinode->gid=0;
 	rootinode->rdev=0;
-	rootinode->size=0;
+	rootinode->size=_INODE_DIRECTORY_SIZE;
 
 	get_current_time(&rootinode->mtim);
 	memcpy(&rootinode->ctim, &rootinode->mtim, sizeof(struct timespec));
@@ -1017,6 +1018,21 @@ void notify_kernel_change(struct workspace_mount_struct *workspace, fuse_ino_t i
 {
 
     /* TODO: */
+
+}
+
+/* function which processes one fuse option by adding it to the fuse arguments list 
+   important here is that every fuse option has to be prefixed by a -o */
+
+static int custom_add_fuseoption(struct fuse_args *fs_fuse_args, char *fuseoption)
+{
+    int len=strlen("-o")+strlen(fuseoption)+1;
+    char option[len];
+
+    memset(option, '\0', len);
+    snprintf(option, len, "-o%s", fuseoption);
+
+    return fuse_opt_add_arg(fs_fuse_args, option);
 
 }
 
@@ -1236,6 +1252,7 @@ static int process_fuse_event(int fd, void *data, uint32_t events)
 int mount_workspace_mount(struct workspace_mount_struct *workspace_mount, char *mountpoint, unsigned int *error)
 {
     int result=0;
+    struct fuse_args workspace_fuse_args = FUSE_ARGS_INIT(0, NULL);
 
     *error=0;
 
@@ -1266,9 +1283,32 @@ int mount_workspace_mount(struct workspace_mount_struct *workspace_mount, char *
 
     }
 
+    /*
+	construct the options to parse to mount command and session setup
+    */
+
+    fuse_opt_add_arg(&workspace_fuse_args, program_name);
+
+    custom_add_fuseoption(&workspace_fuse_args, "allow_other");
+    custom_add_fuseoption(&workspace_fuse_args, "fsname=fuse-workspace");
+
+    if (workspace_mount->workspace_base->type==WORKSPACE_TYPE_DEVICES) {
+
+	custom_add_fuseoption(&workspace_fuse_args, "subtype=devices");
+
+    } else if (workspace_mount->workspace_base->type==WORKSPACE_TYPE_NETWORK) {
+
+	custom_add_fuseoption(&workspace_fuse_args, "subtype=network");
+
+    } else if (workspace_mount->workspace_base->type==WORKSPACE_TYPE_FILE) {
+
+	custom_add_fuseoption(&workspace_fuse_args, "subtype=file");
+
+    }
+
     /* mount */
 
-    workspace_mount->fuseparam.chan=fuse_mount(mountpoint, &global_fuse_args);
+    workspace_mount->fuseparam.chan=fuse_mount(mountpoint, &workspace_fuse_args);
 
     if (workspace_mount->fuseparam.chan) {
 
@@ -1276,7 +1316,7 @@ int mount_workspace_mount(struct workspace_mount_struct *workspace_mount, char *
 
 	if ( add_to_beventloop(fuse_chan_fd(workspace_mount->fuseparam.chan), EPOLLIN, process_fuse_event, (void *) workspace_mount, &workspace_mount->bevent_xdata, workspace_mount->beventloop)) {
 
-	    workspace_mount->fuseparam.session=fuse_lowlevel_new(&global_fuse_args, &workspace_oper, sizeof(workspace_oper), (void *) workspace_mount);
+	    workspace_mount->fuseparam.session=fuse_lowlevel_new(&workspace_fuse_args, &workspace_oper, sizeof(workspace_oper), (void *) workspace_mount);
 
 	    if (workspace_mount->fuseparam.session) {
 
@@ -1308,6 +1348,8 @@ int mount_workspace_mount(struct workspace_mount_struct *workspace_mount, char *
     }
 
     out:
+
+    fuse_opt_free_args(&workspace_fuse_args);
 
     return result;
 

@@ -35,21 +35,22 @@ struct workspace_dh_struct {
     off_t 				offset;
     unsigned char 			mode;
     union {
-	DIR *dp;
-	void *data;
-	int nr;
+	DIR 				*dp;
+	void 				*data;
+	int 				nr;
     } handle;
 };
 
 struct workspace_fh_struct {
-    struct entry_struct *entry;
-    struct workspace_object_struct *object;
-    struct fuse_file_info *fi;
-    unsigned int flags;
-    struct pathinfo_struct pathinfo;
+    struct entry_struct 		*entry;
+    struct workspace_object_struct 	*object;
+    unsigned int			relpath;
+    struct fuse_file_info 		*fi;
+    unsigned int 			flags;
+    struct pathinfo_struct 		pathinfo;
     union {
-	int fd;
-	void *data;
+	int 				fd;
+	void 				*data;
     } handle;
 };
 
@@ -58,7 +59,6 @@ struct module_calls_struct {
     char name[32];
     unsigned char groupid;
 
-    void (*init) (struct workspace_object_struct *object);
     void (*destroy) (struct workspace_object_struct *object);
 
     void (*lookup_cached) (fuse_req_t req, struct entry_struct *entry, struct call_info_struct *call_info);
@@ -109,8 +109,6 @@ struct workspace_object_struct {
     struct workspace_object_struct *next;
     struct workspace_object_struct *prev;
     struct workspace_mount_struct *workspace_mount;
-    struct timespec *refresh_time;
-    struct timespec *detect_time;
     unsigned char primary;
     struct resource_struct *resource;
 };
@@ -121,7 +119,6 @@ struct workspace_object_struct {
 void init_module_calls(struct module_calls_struct *module_calls);
 struct workspace_object_struct *get_workspace_object();
 
-int create_object(char **uri, struct inode_struct *inode, struct workspace_mount_struct *workspace, unsigned char group, unsigned int *error);
-
+struct workspace_object_struct *create_object_simple(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
 
 #endif

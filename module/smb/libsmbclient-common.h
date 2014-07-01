@@ -17,10 +17,23 @@
 
 */
 
-#ifndef FUSE_BROWSE_OVERLAY_H
-#define FUSE_BROWSE_OVERLAY_H
+#ifndef FUSE_LIBSMBCLIENT_COMMON_H
+#define FUSE_LIBSMBCLIENT_COMMON_H
 
-struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
-void set_module_calls_overlay(struct module_calls_struct *mcalls);
+#define SMB_PATH_LEN 1024
+
+struct smbclient_manager_struct {
+    SMBCCTX			*context;
+    pthread_mutex_t		mutex;
+    pthread_cond_t		cond;
+    unsigned char		inuse;
+    struct timespec		connect_time;
+    struct net_smb_share_struct *smb_share;
+    unsigned int 		error;
+};
+
+int create_smbclient_context(struct smbclient_manager_struct *manager, unsigned int *error);
+void init_smbclient_manager(struct smbclient_manager_struct *manager);
+struct smbclient_manager_struct *create_smbclient_manager();
 
 #endif

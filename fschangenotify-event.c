@@ -54,6 +54,7 @@
 #include "fschangenotify.h"
 
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
 
 #ifdef LOGGING

@@ -101,6 +101,8 @@ static inline void dummy_nolog()
 #include "resources.h"
 #include "objects.h"
 
+#include "overlay.h"
+
 struct fs_options_struct fs_options;
 struct workerthreads_queue_struct workerthreads_queue;
 
@@ -108,10 +110,131 @@ extern const char *rootpath;
 extern const char *dotdotname;
 extern const char *dotname;
 
-static void overlay_init(struct workspace_object_struct *object)
+struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error)
 {
+    struct workspace_object_struct *object=NULL;
+    struct resource_struct *resource=NULL;
+    struct localfile_struct *localfile=NULL;
+    struct stat st;
 
-    logoutput("overlay_init: initialize overlay browsing");
+    logoutput("overlay_connect: initialize overlay browsing");
+
+    if (stat(uri->address, &st)==1) {
+
+	*error=errno;
+	return NULL;
+
+    } else if (! S_ISDIR(st.st_mode)) {
+
+	*error=ENOTDIR;
+	return NULL;
+
+    }
+
+    object=get_workspace_object();
+
+    if (! object) {
+
+	*error=ENOMEM;
+	return NULL;
+
+    }
+
+    object->workspace_mount=workspace;
+    set_module_calls_overlay(&object->module_calls);
+
+    lock_resources();
+
+    resource=get_next_resource(NULL);
+
+    while(resource) {
+
+	if (resource->group==RESOURCE_GROUP_FILE) {
+
+	    localfile=(struct localfile_struct *) resource->data;
+
+	    if (localfile->pathinfo.path) {
+
+		if (strcmp(localfile->pathinfo.path, uri->address)==0) break;
+
+	    }
+
+	}
+
+	resource=get_next_resource(resource);
+
+    }
+
+    if (resource) {
+
+	resource->refcount++;
+	object->resource=resource;
+
+    } else {
+
+	resource=get_resource();
+	localfile=malloc(sizeof(struct localfile_struct));
+
+	if (resource && localfile) {
+	    unsigned int len=strlen(uri->address);
+
+	    resource->security=RESOURCE_SECURITY_PUBLIC;
+	    resource->status=RESOURCE_STATUS_OK;
+	    resource->group=RESOURCE_GROUP_FILE;
+
+	    resource->data=(void *) localfile;
+	    resource->refcount=1;
+
+	    localfile->options=0;
+
+	    localfile->pathinfo.path=malloc(len + 1);
+
+	    if (localfile->pathinfo.path) {
+
+		strcpy(localfile->pathinfo.path, uri->address);
+		localfile->pathinfo.len=len;
+		localfile->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
+
+	    } else {
+
+		*error=ENOMEM;
+
+	    }
+
+	    insert_resource_list(resource);
+
+	    object->resource=resource;
+
+	} else {
+
+	    if (resource) {
+
+		free_resource(resource);
+		resource=NULL;
+
+	    }
+
+	    if (localfile) {
+
+		free(localfile);
+		localfile=NULL;
+
+	    }
+
+	    free(object);
+	    object=NULL;
+
+	    *error=ENOMEM;
+
+	}
+
+    }
+
+    unlock:
+
+    unlock_resources();
+
+    return object;
 
 }
 
@@ -778,7 +901,7 @@ static void overlay_readlink(fuse_req_t req, struct entry_struct *entry, struct 
 
 }
 
-void remove_old_entries(struct workspace_object_struct *object, struct directory_struct *directory, struct timespec *synctime)
+static void remove_old_entries(struct workspace_object_struct *object, struct directory_struct *directory, struct timespec *synctime)
 {
     struct entry_struct *entry;
 
@@ -995,7 +1118,7 @@ static void overlay_opendir(fuse_req_t req, struct workspace_dh_struct *dh)
     }
 
     fuse_reply_open(req, dh->fi);
-    add_pathcache(&dh->pathinfo, dh->parent, dh->object, dh->relpath);
+    //add_pathcache(&dh->pathinfo, dh->parent, dh->object, dh->relpath);
     free_path_pathinfo(&dh->pathinfo);
 
     return;
@@ -1917,8 +2040,6 @@ static void overlay_readdirplus_simple(fuse_req_t req, size_t size, off_t offset
 
 		}
 
-		logoutput("overlayfs_readdirplus_real_simple: read %s", xname.name);
-
 		xname.len=strlen(xname.name);
 		calculate_nameindex(&xname);
 
@@ -2191,8 +2312,6 @@ static void overlay_readdirplus_full(fuse_req_t req, size_t size, off_t offset, 
 
 		}
 
-		logoutput("overlayfs_readdirplus_real_full: read %s", xname.name);
-
 		xname.len=strlen(xname.name);
 		calculate_nameindex(&xname);
 
@@ -2366,27 +2485,19 @@ static void overlay_readdirplus_full(fuse_req_t req, size_t size, off_t offset, 
 
 static void overlay_readdir(fuse_req_t req, size_t size, off_t offset, struct workspace_dh_struct *dh)
 {
+    struct overlay_readdir_struct *overlay_readdir=(struct overlay_readdir_struct *)dh->handle.data;
 
-    if (dh->mode & _WORKSPACE_READDIR_MODE_FINISH) {
+    if (overlay_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
 
-	fuse_reply_buf(req, NULL, 0);
+	overlay_readdir_virtual(req, size, offset, dh);
 
-    } else {
-	struct overlay_readdir_struct *overlay_readdir=(struct overlay_readdir_struct *)dh->handle.data;
+    } else if (overlay_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
 
-	if (overlay_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
+	overlay_readdir_simple(req, size, offset, dh);
 
-	    overlay_readdir_virtual(req, size, offset, dh);
+    } else if (overlay_readdir->mode & _FW_READDIR_MODE_FULL) {
 
-	} else if (overlay_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
-
-	    overlay_readdir_simple(req, size, offset, dh);
-
-	} else if (overlay_readdir->mode & _FW_READDIR_MODE_FULL) {
-
-	    overlay_readdir_full(req, size, offset, dh);
-
-	}
+	overlay_readdir_full(req, size, offset, dh);
 
     }
 
@@ -2394,26 +2505,20 @@ static void overlay_readdir(fuse_req_t req, size_t size, off_t offset, struct wo
 
 static void overlay_readdirplus(fuse_req_t req, size_t size, off_t offset, struct workspace_dh_struct *dh)
 {
-    if (dh->mode & _WORKSPACE_READDIR_MODE_FINISH) {
 
-	fuse_reply_buf(req, NULL, 0);
+    struct overlay_readdir_struct *overlay_readdir=(struct overlay_readdir_struct *)dh->handle.data;
 
-    } else {
-	struct overlay_readdir_struct *overlay_readdir=(struct overlay_readdir_struct *)dh->handle.data;
+    if (overlay_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
 
-	if (overlay_readdir->mode & _FW_READDIR_MODE_VIRTUAL) {
+	overlay_readdirplus_virtual(req, size, offset, dh);
 
-	    overlay_readdirplus_virtual(req, size, offset, dh);
+    } else if (overlay_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
 
-	} else if (overlay_readdir->mode & _FW_READDIR_MODE_SIMPLE) {
+	overlay_readdirplus_simple(req, size, offset, dh);
 
-	    overlay_readdirplus_simple(req, size, offset, dh);
+    } else if (overlay_readdir->mode & _FW_READDIR_MODE_FULL) {
 
-	} else if (overlay_readdir->mode & _FW_READDIR_MODE_FULL) {
-
-	    overlay_readdirplus_full(req, size, offset, dh);
-
-	}
+	overlay_readdirplus_full(req, size, offset, dh);
 
     }
 
@@ -2427,7 +2532,7 @@ static void overlay_releasedir(fuse_req_t req, struct workspace_dh_struct *dh)
     unsigned int error=0;
     unsigned int mode=0;
 
-    logoutput("RELEASEDIR");
+    logoutput("overlay_releasedir");
 
     directory=dh->directory;
 
@@ -2461,7 +2566,7 @@ static void overlay_releasedir(fuse_req_t req, struct workspace_dh_struct *dh)
 
     }
 
-    clean_pathcache();
+    // clean_pathcache();
 
 }
 
@@ -2472,7 +2577,6 @@ void set_module_calls_overlay(struct module_calls_struct *mcalls)
 
 	mcalls->groupid		= 0;
 
-	mcalls->init		= overlay_init;
 	mcalls->destroy		= overlay_destroy;
 
 	mcalls->lookup_cached	= overlay_lookup_cached;

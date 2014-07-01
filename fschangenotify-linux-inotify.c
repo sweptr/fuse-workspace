@@ -340,7 +340,7 @@ void evaluate_fsevent_inotify_indir(struct inotify_watch_struct *inotify_watch, 
 
 	pathinfo.path = path;
 	pathinfo.len = watch->pathinfo.len + i_event->len;
-	pathinfo.flags = PATHINFOFLAGS_ALLOCATED;
+	pathinfo.flags = PATHINFO_FLAGS_ALLOCATED;
 
 	/* this should not give an error */
 

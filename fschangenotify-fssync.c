@@ -55,6 +55,7 @@
 #include "readdir-utils.h"
 
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
 
 #include "fschangenotify.h"

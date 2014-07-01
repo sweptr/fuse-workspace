@@ -55,6 +55,7 @@
 #include "utils.h"
 #include "simple-list.h"
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
 
 #include "fschangenotify.h"
@@ -488,12 +489,12 @@ struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t 
 
 	    /* take over the path only if allocated and not inuse */
 
-	    if ((!(pathinfo->flags & PATHINFOFLAGS_INUSE)) && (pathinfo->flags & PATHINFOFLAGS_ALLOCATED)) {
+	    if ((!(pathinfo->flags & PATHINFO_FLAGS_INUSE)) && (pathinfo->flags & PATHINFO_FLAGS_ALLOCATED)) {
 
 		watch->pathinfo.path=pathinfo->path;
 		watch->pathinfo.len=pathinfo->len;
-		watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
-		pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+		watch->pathinfo.flags=PATHINFO_FLAGS_INUSE | PATHINFO_FLAGS_ALLOCATED;
+		pathinfo->flags-=PATHINFO_FLAGS_ALLOCATED;
 		watch->pathinfo.flags=pathinfo->flags;
 
 	    } else {
@@ -505,7 +506,7 @@ struct notifywatch_struct *add_notifywatch(struct inode_struct *inode, uint32_t 
 		    memcpy(watch->pathinfo.path, pathinfo->path, pathinfo->len);
 		    watch->pathinfo.len=pathinfo->len;
 		    watch->pathinfo.flags=pathinfo->flags;
-		    watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
+		    watch->pathinfo.flags=PATHINFO_FLAGS_INUSE | PATHINFO_FLAGS_ALLOCATED;
 
 		} else {
 
@@ -711,12 +712,12 @@ struct notifywatch_struct *add_systemwatch(struct pathinfo_struct *pathinfo, str
 
 	    /* take over the path only if allocated and not inuse */
 
-	    if ((!(pathinfo->flags & PATHINFOFLAGS_INUSE)) && (pathinfo->flags & PATHINFOFLAGS_ALLOCATED)) {
+	    if ((!(pathinfo->flags & PATHINFO_FLAGS_INUSE)) && (pathinfo->flags & PATHINFO_FLAGS_ALLOCATED)) {
 
 		watch->pathinfo.path=pathinfo->path;
 		watch->pathinfo.len=pathinfo->len;
-		watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
-		pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+		watch->pathinfo.flags=PATHINFO_FLAGS_INUSE | PATHINFO_FLAGS_ALLOCATED;
+		pathinfo->flags-=PATHINFO_FLAGS_ALLOCATED;
 		watch->pathinfo.flags=pathinfo->flags;
 
 	    } else {
@@ -728,7 +729,7 @@ struct notifywatch_struct *add_systemwatch(struct pathinfo_struct *pathinfo, str
 		    memcpy(watch->pathinfo.path, pathinfo->path, pathinfo->len);
 		    watch->pathinfo.len=pathinfo->len;
 		    watch->pathinfo.flags=pathinfo->flags;
-		    watch->pathinfo.flags=PATHINFOFLAGS_INUSE | PATHINFOFLAGS_ALLOCATED;
+		    watch->pathinfo.flags=PATHINFO_FLAGS_INUSE | PATHINFO_FLAGS_ALLOCATED;
 
 		} else {
 
@@ -808,14 +809,8 @@ void remove_systemwatch(struct notifywatch_struct *watch)
 
     pthread_mutex_lock(&watch->mutex);
 
-    if (watch->flags & NOTIFYWATCH_FLAG_SYSTEM) {
-
-	watch->cb=NULL;
-	remove_watch_systemwatches(watch);
-
-	watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
-
-    }
+    watch->cb=NULL;
+    watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
 
     if (watch->flags & NOTIFYWATCH_FLAG_NOTIFY) {
 	uint32_t current_mask=watch->mask;
@@ -849,11 +844,7 @@ static void remove_notifywatch_cb(void *data)
 
     if (watch) {
 
-	if (watch->backend) {
-
-	    (* watch->backend->remove_watch) (watch);
-
-	}
+	watch->notifymask=0;
 
 	if (watch->flags & NOTIFYWATCH_FLAG_NOTIFY) {
 
@@ -864,26 +855,31 @@ static void remove_notifywatch_cb(void *data)
 
 	}
 
-	if (watch->flags & NOTIFYWATCH_FLAG_SYSTEM) {
+	/* if not also a systemwatch free it */
 
-	    watch->cb=NULL;
-	    remove_watch_systemwatches(watch);
+	if (!(watch->flags & NOTIFYWATCH_FLAG_SYSTEM)) {
 
-	    watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
+	    if (watch->backend) {
+
+		(* watch->backend->remove_watch) (watch);
+
+	    }
+
+	    pthread_mutex_destroy(&watch->mutex);
+	    free_path_pathinfo(&watch->pathinfo);
+	    free(watch);
 
 	}
-
-	pthread_mutex_destroy(&watch->mutex);
-	free_path_pathinfo(&watch->pathinfo);
-	free(watch);
 
     }
 
 }
 
-void remove_systemwatches()
+void remove_all_watches()
 {
     struct notifywatch_struct *watch=NULL;
+
+    free_group(&group_watches_inode, remove_notifywatch_cb);
 
     pthread_mutex_lock(&systemwatches.mutex);
 
@@ -893,7 +889,25 @@ void remove_systemwatches()
 
 	systemwatches.first=watch->next;
 
-	remove_systemwatch(watch);
+	pthread_mutex_lock(&watch->mutex);
+
+	watch->cb=NULL;
+	watch->flags -= NOTIFYWATCH_FLAG_SYSTEM;
+
+	watch->mask=0;
+
+	if (watch->backend) {
+
+	    (* watch->backend->remove_watch) (watch);
+
+	}
+
+	pthread_mutex_unlock(&watch->mutex);
+
+
+	pthread_mutex_destroy(&watch->mutex);
+	free_path_pathinfo(&watch->pathinfo);
+	free(watch);
 
 	watch=systemwatches.first;
 
@@ -903,12 +917,6 @@ void remove_systemwatches()
 
 }
 
-void remove_notifywatches()
-{
-
-    free_group(&group_watches_inode, remove_notifywatch_cb);
-
-}
 
 int init_fschangenotify(unsigned int *error)
 {
@@ -940,9 +948,9 @@ int init_fschangenotify(unsigned int *error)
 void end_fschangenotify()
 {
 
-    remove_systemwatches();
+    logoutput("end_fschangenotify: remove all watches");
 
-    remove_notifywatches();
+    remove_all_watches();
 
     close_fsnotify_backend();
 

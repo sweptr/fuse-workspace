@@ -46,5 +46,35 @@ AC_CHECK_FUNCS([inotify_init], [AC_DEFINE([HAVE_INOTIFY], [1], [Check for inotif
 PKG_CHECK_MODULES(FUSE, [ fuse3 >= 3.0 ])
 PKG_CHECK_MODULES(GLIB, [ glib-2.0 ])
 
+AC_MSG_CHECKING([whether to use libnfs])
+AC_ARG_WITH([libnfs],
+    [AS_HELP_STRING([--with-libnfs], [use libnfs to browse NFS network and optionally access exports])],
+    [],
+    [with_libnfs=check])
+
+AS_CASE(["$with_libnfs"],
+    [yes], [PKG_CHECK_MODULES(NFS, [ libnfs ], [HAVE_LIBNFS=1])],
+    [no],
+    [PKG_CHECK_MODULES(NFS, [ libnfs ], [HAVE_LIBNFS=1], [HAVE_LIBNFS=0])])
+
+AM_CONDITIONAL([USE_LIBNFS], [test "x$with_libnfs" != xno -a "$HAVE_LIBNFS" = "1"])
+AM_COND_IF([USE_LIBNFS], [AC_DEFINE([HAVE_LIBNFS], [1], [Define if using libnfs.])])
+AC_MSG_RESULT([$with_libnfs])
+
+AC_MSG_CHECKING([whether to use libsmbclient])
+AC_ARG_WITH([libsmbclient],
+    [AS_HELP_STRING([--with-libsmbclient], [use libsmbclient to browse SMB network and optionally access shares])],
+    [],
+    [with_libsmbclient=check])
+
+AS_CASE(["$with_libsmbclient"],
+    [yes], [PKG_CHECK_MODULES(SMB, [ smbclient ], [HAVE_LIBSMBCLIENT=1])],
+    [no],
+    [PKG_CHECK_MODULES(SMB, [ smbclient ], [HAVE_LIBSMBCLIENT=1], [HAVE_LIBSMBCLIENT=0])])
+
+AM_CONDITIONAL([USE_LIBSMBCLIENT], [test "x$with_libsmbclient" != xno -a "$HAVE_LIBSMBCLIENT" = "1"])
+AM_COND_IF([USE_LIBSMBCLIENT], [AC_DEFINE([HAVE_LIBSMBCLIENT], [1], [Define if using libsmbclient.])])
+AC_MSG_RESULT([$with_libsmbclient])
+
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

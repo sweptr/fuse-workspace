@@ -46,6 +46,9 @@
 #define _DIRECTORY_LOCK_PREEXCL					2
 #define _DIRECTORY_LOCK_EXCL					3
 
+#define _INODE_DIRECTORY_SIZE					4096
+#define _DEFAULT_BLOCKSIZE					4096
+
 #include "skiplist.h"
 
 
@@ -107,7 +110,6 @@ void destroy_entry(struct entry_struct *entry);
 void init_inode(struct inode_struct *inode);
 struct inode_struct *create_inode();
 void add_inode_hashtable(struct inode_struct *inode, void (*cb) (void *data), void *data);
-
 
 struct inode_struct *find_inode(fuse_ino_t ino);
 struct inode_struct *remove_inode(fuse_ino_t ino, void (*cb) (void *data), void *data);

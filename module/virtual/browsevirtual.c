@@ -53,6 +53,8 @@
 #include "resources.h"
 #include "objects.h"
 
+#include "browsevirtual.h"
+
 #ifdef LOGGING
 
 static unsigned char loglevel=1;
@@ -90,13 +92,169 @@ extern struct fs_options_struct fs_options;
 extern const char *dotname;
 extern const char *dotdotname;
 
+static unsigned int size_environment_file=1024;
 
+static void read_workspace_uri_file(char *path, struct workspace_uri_struct *uri, unsigned int *error)
+{
+    FILE *fp=NULL;
 
-void check_environment_vars(pid_t pid, char **workspace_uri)
+    fp=fopen(path, "r");
+
+    if (fp) {
+	char *sep, *value;
+	char line[256];
+	unsigned int group=0;
+
+	while(fgets(line, 256, fp)) {
+
+	    sep=strchr(line, '=');
+	    if (! sep) continue;
+
+	    value=sep+1;
+	    *sep='\0';
+
+	    logoutput("read_workspace_uri_file: read option %s, value %s", line, value);
+
+	    convert_to(value, UTILS_CONVERT_SKIPSPACE | UTILS_CONVERT_TOLOWER);
+
+	    if (group==0) {
+
+		if (strcmp(line, "service")==0) {
+
+		    if (strcmp(value, "smb")==0) {
+
+			group=RESOURCE_GROUP_SMB;
+
+			uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_DEFAULT;
+			uri->type.smbinfo.authdata=NULL;
+			uri->type.smbinfo.forceuser=WORKSPACE_FORCEUSER_DEFAULT;
+
+		    } else if (strcmp(value, "nfs")==0) {
+
+			group=RESOURCE_GROUP_NFS;
+
+			uri->type.nfsinfo.forceuser=WORKSPACE_FORCEUSER_DEFAULT;
+
+		    }
+
+		}
+
+		uri->group=group;
+
+	    } else {
+
+		if (group==RESOURCE_GROUP_SMB) {
+
+		    if (strcmp(line, "forceuser")==0) {
+
+			if (strcmp(value, "none")==0) {
+
+			    uri->type.smbinfo.forceuser=WORKSPACE_FORCEUSER_NONE;
+
+			} else if (strcmp(value, "owner")==0) {
+
+			    uri->type.smbinfo.forceuser=WORKSPACE_FORCEUSER_OWNER;
+
+			} else if (strcmp(value, "guest")==0) {
+
+			    uri->type.smbinfo.forceuser=WORKSPACE_FORCEUSER_GUEST;
+
+			}
+
+		    } else if (strcmp(line, "authmethod")==0) {
+
+			if (strcmp(value, "guest")==0) {
+
+			    uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_GUEST;
+
+			} else if (strncmp(value, "password:", 9)==0) {
+			    char *file=NULL;
+
+			    file=value + 9;
+
+			    if (strncmp(file, "file://", 7)==0) {
+				struct stat st;
+
+				file += 7;
+
+				/* just check the file exist, no futher syntax checking for now */
+
+				if (stat(file, &st)==0) {
+
+				    uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_PASSWORD;
+				    uri->type.smbinfo.authdata=strdup(file);
+
+				    if (! uri->type.smbinfo.authdata) {
+
+					uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_DEFAULT;
+
+					logoutput("read_workspace_uri_file: error allocating memory for authdata (%s)", file);
+
+				    }
+
+				}
+
+			    }
+
+			} else if (strcmp(value, "kerberos")==0) {
+
+			    uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_KERBEROS;
+
+			}
+
+		    } else if (strcmp(line, "address")==0) {
+
+			uri->address=strdup(value);
+
+		    }
+
+		} else if (group==RESOURCE_GROUP_NFS) {
+
+		    if (strcmp(line, "forceuser")==0) {
+
+			if (strcmp(value, "none")==0) {
+
+			    uri->type.nfsinfo.forceuser=WORKSPACE_FORCEUSER_NONE;
+
+			} else if (strcmp(value, "owner")==0) {
+
+			    uri->type.nfsinfo.forceuser=WORKSPACE_FORCEUSER_OWNER;
+
+			} else if (strcmp(value, "guest")==0) {
+
+			    uri->type.nfsinfo.forceuser=WORKSPACE_FORCEUSER_GUEST;
+
+			}
+
+		    } else if (strcmp(line, "address")==0) {
+
+			uri->address=strdup(value);
+
+		    }
+
+		}
+
+	    }
+
+	}
+
+	fclose(fp);
+
+    } else {
+
+	*error=errno;
+
+    }
+
+}
+
+int check_environment_vars(pid_t pid, struct workspace_uri_struct *uri, unsigned int *error)
 {
     char path[32];
-    size_t size=1024;
     int fd=0;
+    int result=0;
+
+    *error=0;
 
     logoutput("log_environment_var: pid %i", (int) pid);
 
@@ -107,41 +265,113 @@ void check_environment_vars(pid_t pid, char **workspace_uri)
     if (fd>0) {
 
 	while(1) {
-	    char buffer[size];
-	    int nr=0;
+	    char buffer[size_environment_file];
+	    int size_read=0;
 
-	    nr=pread(fd, buffer, size, 0);
+	    size_read=pread(fd, buffer, size_environment_file, 0);
 
-	    logoutput("log_environment_var: %i read for pid %i", nr, (int) pid);
+	    logoutput("log_environment_var: %i read for pid %i", size_read, (int) pid);
 
-	    if (nr>0 && nr<size) {
+	    if (size_read>0 && size_read<size_environment_file) {
 		char *sep=buffer;
-		unsigned int len=strlen("WORKSPACE_URI");
+		char *value=NULL;
+		unsigned int len0=strlen("WORKSPACE_URI");
+		unsigned int len1=strlen("WORKSPACE_URI_FILE");
 
-		buffer[nr]='\0';
+		buffer[size_read]='\0';
 
-		while(sep<buffer+nr) {
+		while(sep<buffer+size_read) {
 
-		    if (strncmp(sep, "WORKSPACE_URI", len)==0) {
-			char *issign=strchr(sep + len, '=');
+		    if (strncmp(sep, "WORKSPACE_URI_FILE=", len1+1)==0) {
 
-			if (issign) {
+			value=sep + len1 + 1;
 
-			    logoutput("check_environment_vars: found %s, value %s", sep, issign+1);
+			logoutput("check_environment_vars: found %s, value %s", sep, value);
 
-			    if (strncmp(issign+1, "file://", 7)==0) {
+			/* here : call a function like:
 
-				*workspace_uri=malloc(strlen(issign+7));
+			    object = create_object_advanced(value, &error)
 
-				if (*workspace_uri) {
+			*/
 
-				    strcpy(*workspace_uri, issign+7);
+			read_workspace_uri_file(value, uri, error);
 
-				}
+			break;
+
+		    } else if (strncmp(sep, "WORKSPACE_URI=", len0+1)==0) {
+
+			value=sep + len0 + 1;
+
+			logoutput("check_environment_vars: found %s, value %s", sep, value);
+
+			if (strncmp(value, "file://", 7)==0) {
+			    unsigned int len=strlen(value+6) + 1;
+
+			    uri->address=malloc(len);
+
+			    if (uri->address) {
+
+				strcpy(uri->address, value+6);
+				uri->group=RESOURCE_GROUP_FILE;
+
+				*error=0;
+
+			    } else {
+
+				*error=ENOMEM;
+				result=-1;
 
 			    }
 
+			} else if (strncmp(value, "nfs://", 6)==0) {
+			    unsigned int len=strlen(value+6) + 1;
+
+			    uri->address=malloc(len);
+
+			    if (uri->address) {
+
+				strcpy(uri->address, value+6);
+				uri->group=RESOURCE_GROUP_NFS;
+				uri->type.nfsinfo.forceuser=WORKSPACE_FORCEUSER_NONE;
+
+				*error=0;
+
+			    } else {
+
+				*error=ENOMEM;
+				result=-1;
+
+			    }
+
+			} else if (strncmp(value, "smb://", 6)==0) {
+			    unsigned int len=strlen(value+6) + 1;
+
+			    uri->address=malloc(len);
+
+			    if (uri->address) {
+
+				strcpy(uri->address, value+6);
+				uri->group=RESOURCE_GROUP_SMB;
+				uri->type.smbinfo.forceuser=WORKSPACE_FORCEUSER_DEFAULT;
+				uri->type.smbinfo.authmethod=WORKSPACE_AUTHMETHOD_DEFAULT;
+
+				*error=0;
+
+			    } else {
+
+				*error=ENOMEM;
+				result=-1;
+
+			    }
+
+			} else {
+
+			    *error=EINVAL;
+			    result=-1;
+
 			}
+
+			/* var WORKSPACE_URI found: ready */
 
 			break;
 
@@ -153,11 +383,13 @@ void check_environment_vars(pid_t pid, char **workspace_uri)
 
 		break;
 
-	    } else if (nr==size) {
+	    } else if (size_read>=size_environment_file) {
 
-		size+=1024;
+		size_environment_file+=1024;
 
 	    } else {
+
+		*error=errno;
 
 		break;
 
@@ -171,16 +403,14 @@ void check_environment_vars(pid_t pid, char **workspace_uri)
 
 	logoutput("log_environment_var: error %i opening path %s", errno, path);
 
+	*error=errno;
+
     }
 
-}
-
-static void virt_init(struct workspace_object_struct *object)
-{
-
-    logoutput("virt_init: initialize virtual browsing");
+    return result;
 
 }
+
 
 static void virt_destroy(struct workspace_object_struct *object)
 {
@@ -206,6 +436,7 @@ static void virt_lookup_cached(fuse_req_t req, struct entry_struct *entry, struc
     e.attr.st_uid = inode->uid;
     e.attr.st_gid = inode->gid;
     e.attr.st_rdev = inode->rdev;
+    e.attr.st_size = inode->size;
     e.attr.st_atim.tv_sec = 0;
     e.attr.st_atim.tv_nsec = 0;
     e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
@@ -214,15 +445,14 @@ static void virt_lookup_cached(fuse_req_t req, struct entry_struct *entry, struc
     e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
 
     e.attr.st_blksize=4096;
-    e.attr.st_blocks=0;
 
-    if (S_ISDIR(inode->mode)) {
+    if (inode->size % e.attr.st_blksize == 0) {
 
-	e.attr.st_size = 0;
+	e.attr.st_blocks=inode->size / e.attr.st_blksize;
 
     } else {
 
-	e.attr.st_size = inode->size;
+	e.attr.st_blocks=1 + inode->size / e.attr.st_blksize;
 
     }
 
@@ -268,6 +498,19 @@ static void virt_getattr(fuse_req_t req, struct entry_struct *entry, struct call
 
 	st.st_ino=inode->ino;
 	st.st_dev=0;
+
+	st.st_blksize=4096;
+	st.st_blocks=1;
+
+	if (inode->size % st.st_blksize == 0) {
+
+	    st.st_blocks = inode->size / st.st_blksize;
+
+	} else {
+
+	    st.st_blocks = 1 + inode->size / st.st_blksize;
+
+	}
 
 	fuse_reply_attr(req, &st, fs_options.attr_timeout);
 
@@ -398,13 +641,13 @@ static void virt_mkdir (fuse_req_t req, struct inode_struct *pinode, struct name
 
     logoutput("virt_mkdir");
 
-	    /*
-		only root can create a directory
+    /*
+	only root can create a directory
 
-		- test here for environment variables
-		for the resource like:
-		WORKSPACE_URI=...
-	    */
+	- test here for environment variables
+	for the resource like:
+	WORKSPACE_URI=...
+    */
 
 
     if (call_info->uid==0 && call_info->gid==0 ) {
@@ -413,10 +656,41 @@ static void virt_mkdir (fuse_req_t req, struct inode_struct *pinode, struct name
 	unsigned int error=0;
 	mode_t umask=call_info->umask;
 	char *workspace_uri=NULL;
+	struct workspace_object_struct *object=NULL;
+	struct workspace_uri_struct uri;
 
-	/* here look for environment caller */
+	/* here look in environment of the caller */
 
-	check_environment_vars(call_info->pid, &workspace_uri);
+	memset(&uri, 0, sizeof(struct workspace_uri_struct));
+
+	uri.group=0;
+	uri.address=NULL;
+
+	check_environment_vars(call_info->pid, &uri, &error);
+
+	if (error==0 && uri.address) {
+
+	    object=create_object_simple(&uri, call_info->workspace_mount, &error);
+
+	    free_workspace_uri(&uri);
+
+	    if (! object) {
+
+		if (error==0) error=EINVAL;
+
+		fuse_reply_err(req, error);
+		return;
+
+	    }
+
+	} else if (error>0) {
+
+	    free_workspace_uri(&uri);
+
+	    fuse_reply_err(req, error);
+	    return;
+
+	}
 
 	mode = (mode & 01777 & ~umask) | S_IFDIR;
 
@@ -446,7 +720,7 @@ static void virt_mkdir (fuse_req_t req, struct inode_struct *pinode, struct name
 		inode->nlookup=1;
 
 		inode->rdev=0;
-		inode->size=0;
+		inode->size=_INODE_DIRECTORY_SIZE;
 
 		get_current_time(&inode->mtim);
 		memcpy(&inode->ctim, &inode->mtim, sizeof(struct timespec));
@@ -473,37 +747,23 @@ static void virt_mkdir (fuse_req_t req, struct inode_struct *pinode, struct name
 		e.entry_timeout = fs_options.entry_timeout;
 
 		e.attr.st_blksize=4096;
-		e.attr.st_blocks=0;
+
+		if (inode->size % e.attr.st_blksize == 0) {
+
+		    e.attr.st_blocks=inode->size / e.attr.st_blksize;
+
+		} else {
+
+		    e.attr.st_blocks=1 + inode->size / e.attr.st_blksize;
+
+		}
 
     		fuse_reply_entry(req, &e);
 
-		if (workspace_uri) {
+		if (object) {
 
-		    logoutput("virt_mkdir: create workspace uri %s", workspace_uri);
-
-		    /*
-			TODO:
-			- test the uri it's valid
-			- add creation of object
-			- attach object to inode
-			- create a resource
-			- assign the module calls
-		    */
-
-		    error=0;
-
-		    if (create_object(&workspace_uri, inode, call_info->workspace_mount, RESOURCE_GROUP_FILE, &error)==-1) {
-
-			logoutput("virt_mkdir: error %i creating file object", error);
-
-		    }
-
-		    if (workspace_uri) {
-
-			free(workspace_uri);
-			workspace_uri=NULL;
-
-		    }
+		    object->inode=inode;
+		    inode->object=object;
 
 		}
 
@@ -629,87 +889,81 @@ static void virt_opendir(fuse_req_t req, struct workspace_dh_struct *dh)
 
 static void virt_readdir(fuse_req_t req, size_t size, off_t offset, struct workspace_dh_struct *dh)
 {
+    char *buff=NULL, *name=NULL;
+    size_t pos=0, entsize;
+    struct stat st;
+    unsigned int error=0;
+    struct directory_struct *directory=dh->directory;
 
     logoutput("virt_readdir: size %i, offset %i", (int) size, (int) offset);
 
-        char *buff=NULL, *name=NULL;
-	size_t pos=0, entsize;
-	struct stat st;
-	unsigned int error=0;
-	struct directory_struct *directory=dh->directory;
+    buff=malloc(size);
 
-	buff=malloc(size);
+    if (!buff) {
 
-	if (!buff) {
+	fuse_reply_err(req, ENOMEM);
+	return;
 
-	    fuse_reply_err(req, ENOMEM);
-	    return;
+    }
 
-	}
+    if (offset==0) {
 
-	if (offset==0) {
+	/* start at first */
 
-	    /* start at first */
+	dh->handle.data=(void *) directory->first;
 
-	    dh->handle.data=(void *) directory->first;
+    }
 
-	}
+    if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
 
-	if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+	free(buff);
+	buff=NULL;
+	error=EAGAIN;
+	goto error;
 
-	    free(buff);
-	    buff=NULL;
-	    error=EAGAIN;
-	    goto error;
+    }
 
-	}
+    while(1) {
 
-	while(1) {
+	if ( offset==0 ) {
 
-	    if ( offset==0 ) {
+    	    /* the . entry */
 
-    		/* the . entry */
+	    st.st_ino = dh->parent->inode->ino;
+	    st.st_mode = S_IFDIR;
+	    name = (char *) dotname;
 
-		st.st_ino = dh->parent->inode->ino;
-		st.st_mode = S_IFDIR;
-		name = (char *) dotname;
+	} else if ( offset==1 ) {
 
-	    } else if ( offset==1 ) {
+    	    /* the .. entry */
 
-    		/* the .. entry */
+	    if (dh->parent->parent) {
 
-		if (dh->parent->parent) {
-
-		    st.st_ino = dh->parent->parent->inode->ino;
-
-		} else {
-
-		    st.st_ino = dh->parent->inode->ino;
-
-		}
-
-		st.st_mode=S_IFDIR;
-		name = (char *) dotdotname;
+		st.st_ino = dh->parent->parent->inode->ino;
 
 	    } else {
+
+		st.st_ino = dh->parent->inode->ino;
+
+	    }
+
+	    st.st_mode=S_IFDIR;
+	    name = (char *) dotdotname;
+
+	} else {
+
+	    if (! dh->entry) {
 
 		if (dh->handle.data) {
 		    struct entry_struct *entry=(struct entry_struct *) dh->handle.data;
 		    struct inode_struct *inode=entry->inode;
 
-		    if (inode) {
+		    st.st_ino=inode->ino;
+		    st.st_mode=inode->mode;
+		    name = entry->name.name;
 
-			st.st_ino=inode->ino;
-			st.st_mode=inode->mode;
-			name = entry->name.name;
-
-		    } else {
-
-			entry=entry->name_next;
-			dh->handle.data=(void *) entry;
-			continue;
-
-		    }
+		    entry=entry->name_next;
+		    dh->handle.data = (void *) entry;
 
 		} else {
 
@@ -718,31 +972,43 @@ static void virt_readdir(fuse_req_t req, size_t size, off_t offset, struct works
 
 		}
 
-	    }
+	    } else {
+		struct inode_struct *inode=dh->entry->inode;
 
-	    entsize =  fuse_add_direntry(req, buff + pos, size - pos, name, &st, offset + 1);
-
-	    if (pos + entsize > size) {
-
-		dh->offset=offset+1;
-		break;
+		st.st_ino=inode->ino;
+		st.st_mode=inode->mode;
+		name = dh->entry->name.name;
 
 	    }
 
-	    offset++;
-	    pos += entsize;
+	}
+
+	entsize =  fuse_add_direntry(req, buff + pos, size - pos, name, &st, offset + 1);
+
+	if (pos + entsize > size) {
+
+	    dh->offset=offset+1;
+	    break;
 
 	}
 
-	if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+	offset++;
+	pos += entsize;
+	dh->entry=NULL;
 
-	    logoutput("READDIR virtual: error unlocking directory READ");
+    }
 
-	}
+    if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
 
-	fuse_reply_buf(req, buff, pos);
-	free(buff);
-	buff=NULL;
+	logoutput("READDIR virtual: error unlocking directory READ");
+
+    }
+
+    fuse_reply_buf(req, buff, pos);
+    free(buff);
+    buff=NULL;
+
+    return;
 
     error:
 
@@ -754,199 +1020,196 @@ static void virt_readdir(fuse_req_t req, size_t size, off_t offset, struct works
 static void virt_readdirplus(fuse_req_t req, size_t size, off_t offset, struct workspace_dh_struct *dh)
 {
     unsigned int error=0;
+    char *buff=NULL;
+    size_t pos=0;
+    size_t entsize;
+    struct fuse_entry_param e;
+    char *name=NULL;
+    struct directory_struct *directory=dh->directory;
 
     logoutput("virt_readdirplus: size %i, offset %i", (int) size, (int) offset);
 
-	char *buff=NULL;
-	size_t pos=0;
-	size_t entsize;
-	struct fuse_entry_param e;
-	char *name=NULL;
-	struct directory_struct *directory=dh->directory;
+    memset(&e, 0, sizeof(struct fuse_entry_param));
 
-	memset(&e, 0, sizeof(struct fuse_entry_param));
+    e.generation = 1;
+    e.attr_timeout = fs_options.attr_timeout;
+    e.entry_timeout = fs_options.entry_timeout;
 
-	e.generation = 1;
-	e.attr_timeout = fs_options.attr_timeout;
-	e.entry_timeout = fs_options.entry_timeout;
+    e.attr.st_blksize=4096;
+    e.attr.st_blocks=0;
 
-	e.attr.st_blksize=4096;
-	e.attr.st_blocks=0;
+    buff=malloc(size);
 
-	buff=malloc(size);
+    if (! buff) {
 
-	if (! buff) {
+	error=ENOMEM;
+	goto error;
 
-	    error=ENOMEM;
-	    goto error;
+    }
 
-	}
+    if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
 
-	if (lock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+	free(buff);
+	buff=NULL;
+	error=EAGAIN;
+	goto error;
 
-	    free(buff);
-	    buff=NULL;
-	    error=EAGAIN;
-	    goto error;
+    }
 
-	}
+    if (offset==0) {
 
-	if (offset==0) {
+	/* start at first */
 
-	    /* start at first */
+	dh->handle.data=(void *) directory->first;
 
-	    dh->handle.data=(void *) directory->first;
+    }
 
-	}
+    while (pos<size) {
 
-	while (pos<size) {
+    	if (offset==0) {
+	    struct inode_struct *inode=dh->parent->inode;
 
-    	    if (offset==0) {
-		struct inode_struct *inode=dh->parent->inode;
+    	    /* the . entry */
 
-        	/* the . entry */
+	    e.ino = inode->ino;
 
-		e.ino = inode->ino;
+	    e.attr.st_ino = e.ino;
+	    e.attr.st_mode = inode->mode;
+	    e.attr.st_nlink = inode->nlink;
+	    e.attr.st_uid = inode->uid;
+	    e.attr.st_gid = inode->gid;
+	    e.attr.st_rdev = inode->rdev;
+	    e.attr.st_size = 0;
+	    e.attr.st_atim.tv_sec = 0;
+	    e.attr.st_atim.tv_nsec = 0;
+	    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+	    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+	    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+	    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
 
-		e.attr.st_ino = e.ino;
-		e.attr.st_mode = inode->mode;
-		e.attr.st_nlink = inode->nlink;
-		e.attr.st_uid = inode->uid;
-		e.attr.st_gid = inode->gid;
-		e.attr.st_rdev = inode->rdev;
-		e.attr.st_size = 0;
-		e.attr.st_atim.tv_sec = 0;
-		e.attr.st_atim.tv_nsec = 0;
-		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
-		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
-		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
-		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+	    name = (char *) dotname;
 
-		name = (char *) dotname;
+	    inode->nlookup++;
 
-		inode->nlookup++;
+    	} else if (offset==1) {
+    	    struct inode_struct *inode=NULL;
 
-    	    } else if (offset==1) {
-    		struct inode_struct *inode=NULL;
+    	    /* the .. entry */
 
-        	/* the .. entry */
+	    if (! dh->parent->parent) {
 
-		if (! dh->parent->parent) {
+		inode=dh->parent->inode;
 
-		    inode=dh->parent->inode;
+	    } else {
 
-		} else {
-
-		    inode=dh->parent->parent->inode;
-
-		}
-
-		e.ino = inode->ino;
-
-		e.attr.st_ino = e.ino;
-		e.attr.st_mode = inode->mode;
-		e.attr.st_nlink = inode->nlink;
-		e.attr.st_uid = inode->uid;
-		e.attr.st_gid = inode->gid;
-		e.attr.st_rdev = inode->rdev;
-		e.attr.st_size = 0;
-		e.attr.st_atim.tv_sec = 0;
-		e.attr.st_atim.tv_nsec = 0;
-		e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
-		e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
-		e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
-		e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
-
-		name = (char *) dotdotname;
-
-		inode->nlookup++;
-
-    	    } else {
-
-		if (dh->handle.data) {
-		    struct entry_struct *entry=(struct entry_struct *) dh->handle.data;
-		    struct inode_struct *inode=entry->inode;
-
-		    if (inode) {
-
-			e.ino = inode->ino;
-
-			e.attr.st_ino = e.ino;
-			e.attr.st_mode = inode->mode;
-			e.attr.st_nlink = inode->nlink;
-			e.attr.st_uid = inode->uid;
-			e.attr.st_gid = inode->gid;
-			e.attr.st_rdev = inode->rdev;
-
-			if (S_ISDIR(inode->mode)) {
-
-			    e.attr.st_size = 0;
-
-			} else {
-
-			    e.attr.st_size = inode->size;
-
-			}
-
-			e.attr.st_atim.tv_sec = 0;
-			e.attr.st_atim.tv_nsec = 0;
-			e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
-			e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
-			e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
-			e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
-
-			name=entry->name.name;
-
-			inode->nlookup++;
-
-			entry=entry->name_next;
-			dh->handle.data=(void *) entry;
-
-		    } else {
-
-			entry=entry->name_next;
-			dh->handle.data=(void *) entry;
-			continue;
-
-		    }
-
-		} else {
-
-		    dh->mode |= _WORKSPACE_READDIR_MODE_FINISH;
-		    break;
-
-		}
+		inode=dh->parent->parent->inode;
 
 	    }
 
-	    logoutput("virt_readdirplus: add %s", name);
+	    e.ino = inode->ino;
 
-	    entsize =  fuse_add_direntry_plus(req, buff + pos, size - pos, name, &e, offset + 1);
+	    e.attr.st_ino = e.ino;
+	    e.attr.st_mode = inode->mode;
+	    e.attr.st_nlink = inode->nlink;
+	    e.attr.st_uid = inode->uid;
+	    e.attr.st_gid = inode->gid;
+	    e.attr.st_rdev = inode->rdev;
+	    e.attr.st_size = 0;
+	    e.attr.st_atim.tv_sec = 0;
+	    e.attr.st_atim.tv_nsec = 0;
+	    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+	    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+	    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+	    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
 
-	    if (pos + entsize > size) {
+	    name = (char *) dotdotname;
 
-		dh->offset=offset+1;
+	    inode->nlookup++;
+
+    	} else {
+
+	    if (dh->handle.data) {
+		struct entry_struct *entry=(struct entry_struct *) dh->handle.data;
+		struct inode_struct *inode=entry->inode;
+
+		if (inode) {
+
+		    e.ino = inode->ino;
+
+		    e.attr.st_ino = e.ino;
+		    e.attr.st_mode = inode->mode;
+		    e.attr.st_nlink = inode->nlink;
+		    e.attr.st_uid = inode->uid;
+		    e.attr.st_gid = inode->gid;
+		    e.attr.st_rdev = inode->rdev;
+
+		    if (S_ISDIR(inode->mode)) {
+
+			e.attr.st_size = 0;
+
+		    } else {
+
+			e.attr.st_size = inode->size;
+
+		    }
+
+		    e.attr.st_atim.tv_sec = 0;
+		    e.attr.st_atim.tv_nsec = 0;
+		    e.attr.st_mtim.tv_sec = inode->mtim.tv_sec;
+		    e.attr.st_mtim.tv_nsec = inode->mtim.tv_nsec;
+		    e.attr.st_ctim.tv_sec = inode->ctim.tv_sec;
+		    e.attr.st_ctim.tv_nsec = inode->ctim.tv_nsec;
+
+		    name=entry->name.name;
+
+		    inode->nlookup++;
+
+		    entry=entry->name_next;
+		    dh->handle.data=(void *) entry;
+
+		} else {
+
+		    entry=entry->name_next;
+		    dh->handle.data=(void *) entry;
+		    continue;
+
+		}
+
+	    } else {
+
+		dh->mode |= _WORKSPACE_READDIR_MODE_FINISH;
 		break;
 
 	    }
 
-	    offset++;
-	    pos += entsize;
+	}
+
+	entsize =  fuse_add_direntry_plus(req, buff + pos, size - pos, name, &e, offset + 1);
+
+	if (pos + entsize > size) {
+
+	    dh->offset=offset+1;
+	    break;
 
 	}
 
-	if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
+	offset++;
+	pos += entsize;
 
-	    logoutput("READDIR virtual: error unlocking directory READ");
+    }
 
-	}
+    if (unlock_directory(directory, _DIRECTORY_LOCK_READ)==-1) {
 
-	fuse_reply_buf(req, buff, pos);
+	logoutput("READDIR virtual: error unlocking directory READ");
 
-	free(buff);
-	buff=NULL;
+    }
 
-	return;
+    fuse_reply_buf(req, buff, pos);
+
+    free(buff);
+    buff=NULL;
+
+    return;
 
     error:
 
@@ -965,7 +1228,6 @@ static void virt_fsyncdir(fuse_req_t req, int datasync, struct workspace_dh_stru
 static void virt_closedir(fuse_req_t req, struct workspace_dh_struct *dh)
 {
 
-
     fuse_reply_err(req, 0);
     logoutput("virt_closedir: ready");
 
@@ -977,9 +1239,10 @@ static void virt_open(fuse_req_t req, struct workspace_fh_struct *fh)
 
     logoutput("virt_open");
 
-    fuse_reply_err(req, ENOSYS);
-
     free_path_pathinfo(&fh->pathinfo);
+    fh->fi->fh=0;
+
+    fuse_reply_err(req, ENOSYS);
 
 }
 
@@ -1019,6 +1282,11 @@ static void virt_release(fuse_req_t req, struct workspace_fh_struct *fh)
 {
 
     logoutput("virt_release");
+
+    free_path_pathinfo(&fh->pathinfo);
+    fh->fi->fh=0;
+    free(fh);
+
     fuse_reply_err(req, ENOSYS);
 
 }
@@ -1049,42 +1317,12 @@ static void virt_fsetattr(fuse_req_t req, struct workspace_fh_struct *fh, struct
 
 }
 
-struct module_calls_struct virtual_module_calls={
-	.groupid		= 0,
-	.init			= virt_init,
-	.destroy		= virt_destroy,
-	.lookup_cached		= virt_lookup_cached,
-	.lookup_noncached	= virt_lookup_noncached,
-	.getattr		= virt_getattr,
-	.setattr		= virt_setattr,
-	.readlink		= virt_readlink,
-	.mknod			= virt_mknod,
-	.unlink			= virt_unlink,
-	.rename_cached		= virt_rename_cached,
-	.rename_noncached	= virt_rename_noncached,
-	.open			= virt_open,
-	.read			= virt_read,
-	.write			= virt_write,
-	.flush			= virt_flush,
-	.fsync			= virt_fsync,
-	.release		= virt_release,
-	.create			= virt_create,
-	.fgetattr		= virt_fgetattr,
-	.fsetattr		= virt_fsetattr,
-	.opendir		= virt_opendir,
-	.readdir		= virt_readdir,
-	.readdirplus    	= virt_readdirplus,
-	.releasedir		= virt_closedir,
-	.fsyncdir		= virt_fsyncdir,
-};
-
 void set_module_calls_virtual(struct module_calls_struct *mcalls)
 {
 
 	strcpy(mcalls->name, "virtual");
 
 	mcalls->groupid		= 0;
-	mcalls->init		= virt_init;
 	mcalls->destroy		= virt_destroy;
 
 	mcalls->lookup_cached	= virt_lookup_cached;

@@ -1,0 +1,37 @@
+2014-06-24
+
+
+SMBLI SHARES MODULE
+-------------------
+
+Test the readdir functionality.
+Find out to sync.
+Add open, read, write and close.
+Add setattr.
+
+
+CREATION OF A RESOURCE THROUGH mkdir.
+-------------------------------------
+
+Now the creation of a resource like an nfs server and a smb server is done by:
+
+export WORKSPACE_URI=nfs://ip4address
+mkdir %nfsserver%
+
+now add the ability to create a resource by using the environment variable
+
+export WORKSPACE_URI_FILE=/path/to/some/file
+mkdir %server%
+
+fuse-workspace will now test the file for sane values. If that's the case,
+it will create the resource.
+
+The reason for using a file for the uri is that advanced settings are possible.
+When using the WORKSPACE_URI environment variable, for example settings for
+credentials cannot be used.
+
+I'm not sure about the format yet, but an example for a WORKSPACE_URI_FILE can be:
+
+SMB_URI=smb://ipv4address
+SMB_AUTHMETHOD=password:file://some/path/to/a/file
+SMB_OVERRIDE_UID=

@@ -52,10 +52,8 @@
 #include "options.h"
 #include "simple-list.h"
 #include "workspaces.h"
+#include "resources.h"
 #include "objects.h"
-
-
-
 
 #ifdef LOGGING
 
@@ -175,7 +173,7 @@ static char *lookup_pathcache(struct entry_struct *entry, struct call_info_struc
 		pos+=pathcache->len;
 		*pos = '\0';
 		call_info->pathinfo.len=pathcache->len;
-		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 		call_info->object=pathcache->object;
 		call_info->relpath=pathcache->relpath;
 
@@ -218,7 +216,7 @@ static char *lookup_pathcache(struct entry_struct *entry, struct call_info_struc
 		*pos = '\0';
 
 		call_info->pathinfo.len=pathcache->len + 2 + name->len;
-		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 		call_info->object=pathcache->object;
 		call_info->relpath=pathcache->relpath;
 
@@ -276,7 +274,7 @@ static char *lookup_pathcache_extra(struct entry_struct *entry, struct call_info
 		*pos = '\0';
 
 		call_info->pathinfo.len=pathcache->len + 2 + xname->len;
-		call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+		call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 		call_info->object=pathcache->object;
 		call_info->relpath=pathcache->relpath;
 
@@ -394,7 +392,8 @@ int get_path(struct call_info_struct *call_info, struct entry_struct *entry, uns
 	call_info->pathinfo.len=strlen(rootpath);
 	call_info->object=inode->object; /* inode is the rootinode, object is the rootobject */
 
-    } else if (! lookup_pathcache(entry, call_info)) {
+    //} else if (! lookup_pathcache(entry, call_info)) {
+    } else {
 	unsigned int maxlen=pathmax , pathlen=0;
 	char path[maxlen];
 	char *pathstart = NULL;
@@ -407,8 +406,6 @@ int get_path(struct call_info_struct *call_info, struct entry_struct *entry, uns
 	while (1) {
 
 	    name=&entry->name;
-
-	    logoutput("get_path: add %s", name->name);
 
 	    pathstart-=name->len;
 	    memcpy(pathstart, name->name, name->len);
@@ -449,7 +446,8 @@ int get_path(struct call_info_struct *call_info, struct entry_struct *entry, uns
 
 	}
 
-	logoutput("get_path: found path %s, len %i, module calls %s, relpath %i", pathstart, pathlen, call_info->object->module_calls.name, call_info->relpath);
+	logoutput("get_path: path %s", pathstart);
+	logoutput("get_path: len %i, module calls %s, relpath %i", pathlen, call_info->object->module_calls.name, call_info->relpath);
 
 	/* create a path just big enough */
 
@@ -458,7 +456,7 @@ int get_path(struct call_info_struct *call_info, struct entry_struct *entry, uns
 	if ( call_info->pathinfo.path ) {
 
     	    memcpy(call_info->pathinfo.path, pathstart, pathlen+1);
-	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+	    call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 	    call_info->pathinfo.len=pathlen;
 
 	} else {
@@ -495,7 +493,7 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 	    pathstart+=name->len;
 	    *pathstart='\0';
 
-	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+	    call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 	    call_info->pathinfo.len=name->len+1;
 	    call_info->object=call_info->workspace_mount->rootinode.object;
 	    call_info->relpath=0;
@@ -507,7 +505,8 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 
 	}
 
-    } else if (! lookup_pathcache_extra(entry, call_info, extraname)) {
+    //} else if (! lookup_pathcache_extra(entry, call_info, extraname)) {
+    } else {
 	unsigned int maxlen=pathmax + extraname->len + 1, pathlen=0;
 	char path[maxlen + 1];
 	char *pathstart = NULL;
@@ -538,7 +537,7 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 
 	    /* test for and primary object and set the relative path to this object */
 
-	    if (call_info->object) {
+	    if (! call_info->object) {
 
 		object=inode->object;
 
@@ -569,6 +568,8 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 
 	}
 
+	logoutput("get_path_extra: found path %s, len %i, module calls %s, relpath %i", pathstart, pathlen, call_info->object->module_calls.name, call_info->relpath);
+
 	/* create a path just big enough */
 
 	call_info->pathinfo.path=malloc(pathlen+1);
@@ -576,7 +577,7 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 	if ( call_info->pathinfo.path ) {
 
     	    memcpy(call_info->pathinfo.path, pathstart, pathlen+1);
-	    call_info->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
+	    call_info->pathinfo.flags=PATHINFO_FLAGS_ALLOCATED;
 	    call_info->pathinfo.len=pathlen;
 
 	} else {
@@ -594,7 +595,7 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 
 void free_path_pathinfo(struct pathinfo_struct *pathinfo)
 {
-    if ((pathinfo->flags & PATHINFOFLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFOFLAGS_INUSE)) {
+    if ((pathinfo->flags & PATHINFO_FLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFO_FLAGS_INUSE)) {
 
 	if (pathinfo->path) {
 
@@ -603,7 +604,7 @@ void free_path_pathinfo(struct pathinfo_struct *pathinfo)
 
 	}
 
-	pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+	pathinfo->flags-=PATHINFO_FLAGS_ALLOCATED;
 
     }
 
@@ -612,7 +613,7 @@ void free_path_pathinfo(struct pathinfo_struct *pathinfo)
 void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry, struct workspace_object_struct *object, unsigned int relpath)
 {
 
-    if ((pathinfo->flags & PATHINFOFLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFOFLAGS_INUSE)) {
+    if ((pathinfo->flags & PATHINFO_FLAGS_ALLOCATED) && ! (pathinfo->flags & PATHINFO_FLAGS_INUSE)) {
 
 	if (pathinfo->path) {
 	    struct pathcache_struct *pathcache=NULL;
@@ -633,7 +634,7 @@ void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry,
 			pathcache->len=pathinfo->len;
 
 			pathinfo->path=NULL;
-			pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+			pathinfo->flags-=PATHINFO_FLAGS_ALLOCATED;
 
 		    }
 
@@ -662,7 +663,7 @@ void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry,
 		    pathcache_list=pathcache;
 
 		    pathinfo->path=NULL;
-		    pathinfo->flags-=PATHINFOFLAGS_ALLOCATED;
+		    pathinfo->flags-=PATHINFO_FLAGS_ALLOCATED;
 
 		}
 

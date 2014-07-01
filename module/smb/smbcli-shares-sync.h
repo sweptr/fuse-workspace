@@ -17,10 +17,21 @@
 
 */
 
-#ifndef FUSE_BROWSE_OVERLAY_H
-#define FUSE_BROWSE_OVERLAY_H
+#ifndef FUSE_SMBCLI_SHARE_SYNC_H
+#define FUSE_SMBCLI_SHARE_SYNC_H
 
-struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
-void set_module_calls_overlay(struct module_calls_struct *mcalls);
+//#ifdef HAVE_SMBCLI
+
+int set_module_calls_smbcli_shares_sync(struct module_calls_struct *mcalls);
+
+//#else
+
+//int set_module_calls_smbcli_shares(struct module_calls_struct *mcalls)
+//{
+//    return -ENOSYS;
+
+//}
+
+//#endif
 
 #endif

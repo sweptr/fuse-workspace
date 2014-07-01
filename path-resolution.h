@@ -24,9 +24,9 @@ typedef char pathstring[PATH_MAX+1];
 
 #define CALL_INFO_INIT	{{NULL, 0, 0}, 0, 0, 0, 0, NULL, NULL, 0, 0}
 
-#define PATHINFOFLAGS_NONE		0
-#define PATHINFOFLAGS_ALLOCATED		1
-#define PATHINFOFLAGS_INUSE		2
+#define PATHINFO_FLAGS_NONE			0
+#define PATHINFO_FLAGS_ALLOCATED		1
+#define PATHINFO_FLAGS_INUSE			2
 
 struct pathinfo_struct {
     char *path;
@@ -53,10 +53,10 @@ int get_path_extra(struct call_info_struct *call_info, struct entry_struct *entr
 
 void free_path_pathinfo(struct pathinfo_struct *pathinfo);
 
-int init_pathcache_group(unsigned int *error);
-void clean_pathcache();
-void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry, struct workspace_object_struct *object, unsigned int relpath);
-void destroy_pathcache();
+//int init_pathcache_group(unsigned int *error);
+//void clean_pathcache();
+//void add_pathcache(struct pathinfo_struct *pathinfo, struct entry_struct *entry, struct workspace_object_struct *object, unsigned int relpath);
+//void destroy_pathcache();
 
 void adjust_pathmax(unsigned int len);
 unsigned int get_pathmax();

@@ -17,10 +17,10 @@
 
 */
 
-#ifndef FUSE_BROWSE_OVERLAY_H
-#define FUSE_BROWSE_OVERLAY_H
+#ifndef FUSE_NFS_COMMON_H
+#define FUSE_NFS_COMMON_H
 
-struct workspace_object_struct *overlay_connect(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
-void set_module_calls_overlay(struct module_calls_struct *mcalls);
+struct workspace_object_struct *workspace_nfs_connect_server(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error);
+struct workspace_object_struct *create_nfs_export_object(struct pathinfo_struct *pathinfo, struct workspace_object_struct *server_object, unsigned int *error);
 
 #endif

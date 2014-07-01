@@ -111,7 +111,7 @@ static void print_version()
 
 }
 
-static void read_config(char *path, char **fuseoptions)
+static void read_config(char *path)
 {
     FILE *fp;
 
@@ -269,22 +269,6 @@ static void read_config(char *path, char **fuseoptions)
 
 		    }
 
-		} else if (strcmp(option, "fuse.options")==0) {
-
-		    if (strlen(value)>0) {
-
-			if (! *fuseoptions) {
-
-			    *fuseoptions=strdup(value);
-
-			} else {
-
-			    fprintf(stderr, "fuseoptions set in configfile %s, but also set on commandline %s\n", path, *fuseoptions);
-
-			}
-
-		    }
-
 		}
 
 	    }
@@ -297,29 +281,12 @@ static void read_config(char *path, char **fuseoptions)
 
 }
 
-
-
-/* function which processes one fuse option by adding it to the fuse arguments list 
-   important here is that every fuse option has to be prefixed by a -o */
-
-static int parsefuseoption(struct fuse_args *fs_fuse_args, char *fuseoption)
-{
-    int len=strlen("-o")+strlen(fuseoption)+1;
-    char tmpoption[len];
-
-    memset(tmpoption, '\0', len);
-    snprintf(tmpoption, len, "-o%s", fuseoption);
-
-    return fuse_opt_add_arg(fs_fuse_args, tmpoption);
-
-}
-
 /* function to parse all the commandline arguments, and split the normal notifyfs arguments 
    and the arguments meant for fuse
    normal options are specified as long options, like --logging
    fuse options are specified in a "single" option with -osomefuseoption,anotherfuseoption*/
 
-int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsigned int *error)
+int parse_arguments(int argc, char *argv[], unsigned int *error)
 {
     static struct option long_options[] = {
 	{"help", 		optional_argument, 		0, 0},
@@ -329,7 +296,6 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 	{0,0,0,0}
 	};
     int res, long_options_index=0, result=0;
-    char *fuseoptions=NULL;
     struct stat st;
 
     /* set defaults */
@@ -342,15 +308,6 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
     fs_options.attr_timeout=1.0;
     fs_options.entry_timeout=1.0;
     fs_options.negative_timeout=1.0;
-
-    /* start the fuse options with the program name, just like the normal argv */
-
-    if (fuse_opt_add_arg(fs_fuse_args, argv[0])<0) {
-
-	result=-1;
-	*error=EINVAL;
-
-    }
 
     while(1) {
 
@@ -433,27 +390,6 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
 		    }
 
-		} else if ( strcmp(long_options[long_options_index].name, "fuseoptions")==0 ) {
-
-		    if ( optarg ) {
-
-			fuseoptions=strdup(optarg);
-
-			if ( ! fuseoptions ) {
-
-			    result=-1;
-			    *error=ENOMEM;
-			    goto out;
-
-			}
-
-
-		    } else {
-
-			fprintf(stderr, "Warning: option --fuseoptions requires an argument. Ignoring.\n");
-
-		    }
-
 		}
 
 	    case '?':
@@ -472,64 +408,14 @@ int parse_arguments(int argc, char *argv[], struct fuse_args *fs_fuse_args, unsi
 
     if (fs_options.configfile) {
 
-	read_config(fs_options.configfile, &fuseoptions);
+	read_config(fs_options.configfile);
 
     } else {
 
-	read_config(FUSE_WORKSPACE_CONFIGFILE, &fuseoptions);
+	read_config(FUSE_WORKSPACE_CONFIGFILE);
 
     }
 
-    if (fuseoptions) {
-	char *sep=NULL;
-	char *fuseoption=fuseoptions;
-
-	/* parse the comma seperated list into something fuse understands */
-
-	while(1) {
-
-	    sep=strchr(fuseoption, ',');
-
-	    if (sep) {
-
-		*sep='\0';
-		result=parsefuseoption(fs_fuse_args, fuseoption);
-
-		if (result<0) {
-
-		    result=-1;
-		    *error=ENOMEM;
-		    goto finish;
-
-		}
-
-		*sep=',';
-		sep++;
-		fuseoption=sep;
-
-	    } else {
-
-		if (strlen(fuseoption)>0) {
-
-		    result=parsefuseoption(fs_fuse_args, fuseoption);
-
-		    if (result<0) {
-
-			result=-1;
-			*error=ENOMEM;
-			goto finish;
-
-		    }
-
-		}
-
-		break;
-
-	    }
-
-	}
-
-    }
 
     finish:
 

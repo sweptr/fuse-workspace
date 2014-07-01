@@ -20,7 +20,6 @@
 #ifndef FUSE_BROWSE_VIRTUAL_H
 #define FUSE_BROWSE_VIRTUAL_H
 
-
 void set_module_calls_virtual(struct module_calls_struct *mcalls);
 
 #endif

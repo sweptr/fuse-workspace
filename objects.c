@@ -47,8 +47,13 @@
 #include "workspaces.h"
 #include "path-resolution.h"
 #include "resources.h"
-
 #include "objects.h"
+
+#include "module/virtual/browsevirtual.h"
+
+#include "module/file/overlay.h"
+#include "module/nfs/nfs-common.h"
+#include "module/smb/smb-common.h"
 
 #ifdef LOGGING
 
@@ -88,7 +93,6 @@ void init_module_calls(struct module_calls_struct *module_calls)
     memset(module_calls->name, '\0', sizeof(module_calls->name));
     module_calls->groupid=0;
 
-    module_calls->init=NULL;
     module_calls->destroy=NULL;
 
     module_calls->lookup_cached=NULL;
@@ -155,13 +159,11 @@ struct workspace_object_struct *get_workspace_object()
 	/* module calls */
 
 	init_module_calls(&object->module_calls);
+	set_module_calls_virtual(&object->module_calls);
 
 	/* workspace */
 
 	object->workspace_mount=NULL;
-
-	object->refresh_time=NULL;
-	object->detect_time=NULL;
 
 	object->primary=0;
 	object->resource=NULL;
@@ -172,132 +174,96 @@ struct workspace_object_struct *get_workspace_object()
 
 }
 
-static int _create_overlay_object(char **path, struct inode_struct *inode, struct workspace_mount_struct *workspace, unsigned int *error)
+struct workspace_object_struct *create_object_simple(struct workspace_uri_struct *uri, struct workspace_mount_struct *workspace, unsigned int *error)
 {
-    struct stat st;
-    int result=0;
+    struct workspace_object_struct *object=NULL;
+    struct workspace_base_struct *base=workspace->workspace_base;
 
-    /* path has to exist */
+    *error=EINVAL;
 
-    if (stat(*path, &st)==0) {
-	struct workspace_object_struct *object=NULL;
-	struct resource_struct *resource=NULL;
-	struct localfile_struct *localfile=NULL;
+    /* here walk through the known modules */
 
-	object=get_workspace_object();
+    if (uri->group==RESOURCE_GROUP_FILE) {
 
-	if (! object) {
+	if (base->type==WORKSPACE_TYPE_FILE) {
 
-	    *error=ENOMEM;
-	    return -1;
+	    logoutput("create_object: creating file object for %s", uri->address);
 
-	}
+	    object=overlay_connect(uri, workspace, error);
 
-	object->inode=inode;
-	inode->object=object;
-	object->workspace_mount=workspace;
-	object->primary=1;
+	    if (object) {
 
-	lock_resources();
+		object->primary=1;
 
-	resource=get_next_resource(NULL);
-
-	while(resource) {
-
-	    if (resource->group==RESOURCE_GROUP_FILE) {
-
-		localfile=(struct localfile_struct *) resource->data;
-
-		if (localfile->pathinfo.path) {
-
-		    if (strcmp(localfile->pathinfo.path, *path)==0) break;
-
-		}
+		*error=0;
+		return object;
 
 	    }
-
-	    resource=get_next_resource(resource);
-
-	}
-
-	if (resource) {
-
-	    resource->refcount++;
-	    object->resource=resource;
 
 	} else {
 
-	    localfile=malloc(sizeof(struct localfile_struct));
-	    resource=get_resource();
-
-	    if (localfile && resource) {
-
-		resource->security=RESOURCE_SECURITY_PUBLIC;
-		resource->status=RESOURCE_STATUS_OK;
-		resource->group=RESOURCE_GROUP_FILE;
-
-		resource->data=(void *) localfile;
-		resource->refcount=1;
-
-		localfile->options=0;
-		localfile->pathinfo.path=*path;
-		localfile->pathinfo.len=strlen(*path);
-		localfile->pathinfo.flags=PATHINFOFLAGS_ALLOCATED;
-		*path=NULL;
-
-		insert_resource_list(resource);
-
-		object->resource=resource;
-
-		logoutput("_create_overlay_object: set module calls overlay");
-
-		set_module_calls_overlay(&object->module_calls);
-
-	    } else {
-
-		if (localfile) {
-
-		    free(localfile);
-		    localfile=NULL;
-
-		}
-
-		if (resource) {
-
-		    free_resource(resource);
-		    resource=NULL;
-
-		}
-
-		result=-1;
-		*error=ENOMEM;
-
-	    }
+	    logoutput("create_object: cannot create file object for %s in %s: wrong type", uri->address, workspace->fuseparam.mountpoint);
+	    *error=EINVAL;
+	    return NULL;
 
 	}
 
-	unlock_resources();
+    } else if (uri->group==RESOURCE_GROUP_NFS) {
+
+	if (base->type==WORKSPACE_TYPE_NETWORK) {
+	    struct workspace_object_struct *object=NULL;
+
+	    logoutput("create_object: creating nfs object for %s", uri->address);
+
+	    object=workspace_nfs_connect_server(uri, workspace, error);
+
+	    if (object) {
+
+		object->primary=1;
+
+		*error=0;
+		return object;
+
+	    }
+
+	} else {
+
+	    logoutput("create_object: cannot create file object for %s in %s: wrong type", uri->address, workspace->fuseparam.mountpoint);
+	    *error=EINVAL;
+	    return NULL;
+
+
+	}
+
+    } else if (uri->group==RESOURCE_GROUP_SMB) {
+
+	if (base->type==WORKSPACE_TYPE_NETWORK) {
+	    struct workspace_object_struct *object=NULL;
+
+	    logoutput("create_object: creating smb object for %s", uri->address);
+
+	    object=workspace_smb_connect_server(uri, workspace, error);
+
+	    if (object) {
+
+		object->primary=1;
+
+		*error=0;
+		return object;
+
+	    }
+
+	} else {
+
+	    logoutput("create_object: cannot create file object for %s in %s: wrong type", uri->address, workspace->fuseparam.mountpoint);
+	    *error=EINVAL;
+	    return NULL;
+
+	}
 
     }
 
-    logoutput("_create_overlay_object: result %i", result);
-
-    return result;
-
-}
-
-int create_object(char **uri, struct inode_struct *inode, struct workspace_mount_struct *workspace, unsigned char group, unsigned int *error)
-{
-
-    if (group==RESOURCE_GROUP_FILE) {
-
-	logoutput("create_object: create file object for %s", *uri);
-
-	return _create_overlay_object(uri, inode, workspace, error);
-
-    }
-
-    *error=EINVAL;
-    return -1;
+    if (*error==0) *error=EINVAL;
+    return NULL;
 
 }
